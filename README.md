@@ -163,4 +163,4 @@ Development in collaboration with Claude (Opus 4.7 Adaptive. Accessed May 2026).
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+OTU-GL — see [`LICENSE`](https://github.com/TheStudent00/PyHaxe/blob/main/OTU%20GREEN%20LICENSE%20FOR%20UNIVERSAL%20WORKS.pdf).
