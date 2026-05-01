@@ -1,3 +1,5 @@
+*note: early days*
+
 # disciplined-haxe
 
 A linter and transpiler that lets you write Python and ship Haxe.
