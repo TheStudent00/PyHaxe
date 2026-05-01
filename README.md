@@ -159,6 +159,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup and coding standa
 
 Inspired by [Haxe](https://haxe.org), [CoffeeScript](https://coffeescript.org), and protobuf's wrapper-based approach to cross-language interop. Built on Python's standard `ast` module — which does most of the heavy lifting and asks nothing in return.
 
+Development in collaboration with Claude (Opus 4.7 Adaptive. Accessed May 2026).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
