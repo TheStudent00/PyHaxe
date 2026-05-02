@@ -1,5 +1,5 @@
 extern class Print {
-    static function line(message:String):Void;
+    public static function line(message:String):Void;
 }
 
 class Counter {
