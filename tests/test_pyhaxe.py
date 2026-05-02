@@ -26,7 +26,7 @@ EXAMPLES = REPO_ROOT / "examples"
 # ============================================================
 
 def test_checker_passes_on_disciplined_examples():
-    for filename in ["basic_example.py", "inventory_example.py"]:
+    for filename in ["basic_example.py", "inventory_example.py", "classes_example.py"]:
         violations = check_file(str(EXAMPLES / filename))
         assert violations == [], (
             filename + " should be clean but has " +
@@ -61,8 +61,16 @@ def test_checker_catches_violations_in_bad_example():
 # ============================================================
 
 def test_emitter_produces_expected_output_for_basic_example():
-    py_path = EXAMPLES / "basic_example.py"
-    hx_path = EXAMPLES / "basic_example.hx"
+    _check_golden("basic_example")
+
+
+def test_emitter_produces_expected_output_for_classes_example():
+    _check_golden("classes_example")
+
+
+def _check_golden(stem):
+    py_path = EXAMPLES / (stem + ".py")
+    hx_path = EXAMPLES / (stem + ".hx")
 
     source = py_path.read_text()
     actual = convert(source, str(py_path)).strip()
@@ -72,7 +80,7 @@ def test_emitter_produces_expected_output_for_basic_example():
         "emitter output for " + py_path.name +
         " has diverged from the checked-in golden file. " +
         "If the change is intentional, regenerate the .hx file with " +
-        "`pyhaxe-emit examples/basic_example.py > examples/basic_example.hx`."
+        "`pyhaxe-emit examples/" + stem + ".py > examples/" + stem + ".hx`."
     )
 
 
