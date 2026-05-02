@@ -26,7 +26,8 @@ EXAMPLES = REPO_ROOT / "examples"
 # ============================================================
 
 def test_checker_passes_on_disciplined_examples():
-    for filename in ["basic_example.py", "inventory_example.py", "classes_example.py"]:
+    for filename in ["basic_example.py", "inventory_example.py",
+                     "classes_example.py", "collections_example.py"]:
         violations = check_file(str(EXAMPLES / filename))
         assert violations == [], (
             filename + " should be clean but has " +
@@ -66,6 +67,10 @@ def test_emitter_produces_expected_output_for_basic_example():
 
 def test_emitter_produces_expected_output_for_classes_example():
     _check_golden("classes_example")
+
+
+def test_emitter_produces_expected_output_for_collections_example():
+    _check_golden("collections_example")
 
 
 def _check_golden(stem):

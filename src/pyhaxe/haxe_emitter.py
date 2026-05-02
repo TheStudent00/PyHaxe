@@ -15,8 +15,13 @@ Status:
     parameter default values, @haxe_extern wrapper detection (emits
     `extern class` declarations).
 
+    Milestone 3: collections and iteration. for-loops over collections
+    (`for x in items`) and ranges (`for i in range(N)`), list literals
+    (`[a, b, c]`), dict literals (`{"a": 1}` -> `["a" => 1]`),
+    subscripting (read and write), len(x) -> x.length, list.append ->
+    list.push.
+
 Future milestones (in order):
-    3. Collections and iteration — for x in coll, for i in range(N), len()
     4. Signature-aware kwargs resolution
     5. Try/except/raise
     6. Type system extensions — Optional, List, Dict -> Null, Array, Map
@@ -69,6 +74,11 @@ COMPARE_MAP = {
     ast.LtE: "<=",
     ast.Gt: ">",
     ast.GtE: ">=",
+    # `is` and `is not` are identity checks in Python; for the common
+    # case of comparing against None they map cleanly to Haxe's == / !=.
+    # Disciplined Python avoids `is` for non-None comparisons.
+    ast.Is: "==",
+    ast.IsNot: "!=",
 }
 
 BOOLOP_MAP = {
@@ -88,6 +98,13 @@ AUGASSIGN_MAP = {
     ast.Mult: "*=",
     ast.Div: "/=",
     ast.Mod: "%=",
+}
+
+# Python list/dict method names that have direct Haxe equivalents under
+# different names. Applied at call sites where the call is shaped like
+# obj.method(args).
+METHOD_RENAMES = {
+    "append": "push",
 }
 
 
@@ -143,8 +160,13 @@ class HaxeEmitter:
             # Python <3.9 wrapped the slice in ast.Index; handle both for safety
             if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
                 slice_node = slice_node.value
+            haxe_base = GENERIC_TYPES.get(base, base)
+            # Tuple slice -> multi-arg generic, e.g. Dict[K, V] -> Map<K, V>
+            if isinstance(slice_node, ast.Tuple):
+                inner_parts = [self.emit_type(elt) for elt in slice_node.elts]
+                return haxe_base + "<" + ", ".join(inner_parts) + ">"
             inner = self.emit_type(slice_node)
-            return GENERIC_TYPES.get(base, base) + "<" + inner + ">"
+            return haxe_base + "<" + inner + ">"
         if isinstance(node, ast.Constant):
             # String forward-references like "Counter" or None for Void.
             if node.value is None:
@@ -438,6 +460,33 @@ class HaxeEmitter:
         self.indent_level -= 1
         self.line("}")
 
+    def stmt_For(self, node):
+        # Disciplined Python: target is always a single Name (no tuple
+        # unpacking), iter is either a `range(...)` call or a collection.
+        target = self.emit_expr(node.target)
+        iter_expr = self._format_for_iter(node.iter)
+        self.line("for (" + target + " in " + iter_expr + ") {")
+        self.indent_level += 1
+        for stmt in node.body:
+            self.emit_stmt(stmt)
+        self.indent_level -= 1
+        self.line("}")
+
+    def _format_for_iter(self, node):
+        # `range(N)` -> `0...N`,  `range(start, stop)` -> `start...stop`.
+        # Haxe's `...` is exclusive on the right, matching Python's range.
+        # Three-argument range with a step is not supported in Haxe's
+        # range literal; emit a TODO so it surfaces in output.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "range":
+            args = node.args
+            if len(args) == 1:
+                return "0..." + self.emit_expr(args[0])
+            if len(args) == 2:
+                return self.emit_expr(args[0]) + "..." + self.emit_expr(args[1])
+            return "/* TODO range with step */"
+        return self.emit_expr(node)
+
     def stmt_Pass(self, node):
         # Haxe is fine with empty blocks; emit nothing.
         pass
@@ -507,9 +556,32 @@ class HaxeEmitter:
             args = [self.emit_expr(a) for a in node.args]
             return "super(" + ", ".join(args) + ")"
 
+        # Special case: len(x) -> x.length. Python builtin -> Haxe property.
+        if isinstance(node.func, ast.Name) and node.func.id == "len" \
+                and len(node.args) == 1:
+            return self.emit_expr(node.args[0]) + ".length"
+
+        # Special case: str(x) -> Std.string(x). Python builtin -> Haxe
+        # standard library function. Only the single-argument form maps
+        # cleanly; str() with no args (returns "") and str(x, encoding)
+        # don't have direct Haxe equivalents.
+        if isinstance(node.func, ast.Name) and node.func.id == "str" \
+                and len(node.args) == 1:
+            return "Std.string(" + self.emit_expr(node.args[0]) + ")"
+
+        # Method renames: list.append(x) -> list.push(x), etc. Applied
+        # when the call is shaped like obj.method(args) and the method
+        # name appears in METHOD_RENAMES.
+        if isinstance(node.func, ast.Attribute) \
+                and node.func.attr in METHOD_RENAMES:
+            receiver = self.emit_expr(node.func.value)
+            new_method = METHOD_RENAMES[node.func.attr]
+            args = [self.emit_expr(a) for a in node.args]
+            return receiver + "." + new_method + "(" + ", ".join(args) + ")"
+
         func = self.emit_expr(node.func)
         args = [self.emit_expr(a) for a in node.args]
-        # Kwargs are handled by Milestone 5; for now mark them.
+        # Kwargs are handled by Milestone 4; for now mark them.
         for kw in node.keywords:
             args.append("/*kwarg " + kw.arg + "=*/" + self.emit_expr(kw.value))
 
@@ -532,6 +604,33 @@ class HaxeEmitter:
 
     def expr_Attribute(self, node):
         return self.emit_expr(node.value) + "." + node.attr
+
+    def expr_List(self, node):
+        elements = [self.emit_expr(e) for e in node.elts]
+        return "[" + ", ".join(elements) + "]"
+
+    def expr_Dict(self, node):
+        # Haxe map literal syntax: ["key" => value, ...]. Empty dicts
+        # are ambiguous (Haxe needs a type hint to disambiguate from an
+        # empty array); emit `new Map()` as a safer default.
+        if not node.keys:
+            return "new Map()"
+        pairs = []
+        for key, value in zip(node.keys, node.values):
+            pairs.append(self.emit_expr(key) + " => " + self.emit_expr(value))
+        return "[" + ", ".join(pairs) + "]"
+
+    def expr_Subscript(self, node):
+        # Used for both reading (x = arr[i]) and writing (arr[i] = x).
+        # Same surface syntax in Haxe; the AST parent (Assign vs not)
+        # determines which.
+        receiver = self.emit_expr(node.value)
+        slice_node = node.slice
+        # Python <3.9 wrapped the slice in ast.Index; handle both.
+        if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+            slice_node = slice_node.value
+        index = self.emit_expr(slice_node)
+        return receiver + "[" + index + "]"
 
 
 # ============================================================
