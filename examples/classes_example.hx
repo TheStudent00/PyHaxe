@@ -2,10 +2,17 @@ extern class Print {
     public static function line(message:String):Void;
 }
 
+typedef CounterNewOptions = {
+    ?start:Int,
+    ?step:Int
+}
+
 class Counter {
     public var value:Int;
     public var step:Int;
-    public function new(start:Int = 0, step:Int = 1):Void {
+    public function new(options:CounterNewOptions):Void {
+        var start:Int = (options.start != null) ? options.start : 0;
+        var step:Int = (options.step != null) ? options.step : 1;
         this.value = start;
         this.step = step;
     }
@@ -20,15 +27,24 @@ class Counter {
     }
     
     public static function make_default():Counter {
-        return new Counter();
+        return new Counter({  });
     }
     
 }
 
+typedef BoundedCounterNewOptions = {
+    ?start:Int,
+    ?step:Int,
+    ?maximum:Int
+}
+
 class BoundedCounter extends Counter {
     public var maximum:Int;
-    public function new(start:Int = 0, step:Int = 1, maximum:Int = 100):Void {
-        super(start, step);
+    public function new(options:BoundedCounterNewOptions):Void {
+        var start:Int = (options.start != null) ? options.start : 0;
+        var step:Int = (options.step != null) ? options.step : 1;
+        var maximum:Int = (options.maximum != null) ? options.maximum : 100;
+        super({ start: start, step: step });
         this.maximum = maximum;
     }
     

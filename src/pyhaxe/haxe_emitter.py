@@ -21,8 +21,12 @@ Status:
     subscripting (read and write), len(x) -> x.length, list.append ->
     list.push.
 
+    Milestone 4: kwargs handling. Functions with default values emit as
+    options-struct (typedef + single-param function with destructuring
+    prelude); functions without defaults stay positional and call sites
+    with kwargs are reordered to match parameter declaration order.
+
 Future milestones (in order):
-    4. Signature-aware kwargs resolution
     5. Try/except/raise
     6. Type system extensions — Optional, List, Dict -> Null, Array, Map
     7. Module/import system
@@ -121,10 +125,14 @@ class HaxeEmitter:
         # whether they are emitting at module scope or inside a class body.
         self.in_class = False
         self.current_class_name = None
-        # Class registry: { class_name: { "bases": [...], "methods": set(...) } }
-        # Built by a first pass over the module so that emission can detect
-        # method overrides and emit the `override` keyword Haxe requires.
+        # Class registry: { class_name: { "bases": [...], "methods": set(...),
+        # "method_signatures": {name: signature} } }. Built by a first pass
+        # over the module so that emission can detect method overrides and
+        # emit the `override` keyword Haxe requires.
         self.classes = {}
+        # Function registry: { function_name: signature }. Built alongside
+        # classes; used for kwarg resolution at module-level call sites.
+        self.functions = {}
 
     def line(self, text):
         self.lines.append("    " * self.indent_level + text)
@@ -178,9 +186,11 @@ class HaxeEmitter:
     # === Module ===
 
     def emit_module(self, node):
-        # First pass: build the class registry so the emitter can detect
-        # method overrides during the second pass.
+        # First pass: build the class and function registries so emission
+        # can detect method overrides, resolve kwargs to positional, and
+        # decide which functions take options structs.
         self._scan_classes(node)
+        self._scan_functions(node)
         for stmt in node.body:
             self.emit_stmt(stmt)
 
@@ -193,10 +203,121 @@ class HaxeEmitter:
                 if isinstance(base, ast.Name):
                     bases.append(base.id)
             methods = set()
+            method_signatures = {}
             for item in stmt.body:
                 if isinstance(item, ast.FunctionDef):
                     methods.add(item.name)
-            self.classes[stmt.name] = {"bases": bases, "methods": methods}
+                    method_signatures[item.name] = self._build_signature(item)
+            self.classes[stmt.name] = {
+                "bases": bases,
+                "methods": methods,
+                "method_signatures": method_signatures,
+            }
+
+    def _scan_functions(self, module_node):
+        # Module-level function signatures, used for kwarg resolution at
+        # call sites that target free functions.
+        if not hasattr(self, "functions"):
+            self.functions = {}
+        for stmt in module_node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                self.functions[stmt.name] = self._build_signature(stmt)
+
+    def _build_signature(self, func_node):
+        # Capture parameter names in order, paired with their default
+        # nodes (or None). Defaults are right-aligned in Python's AST,
+        # so the last N args have the last N defaults.
+        non_self = [a for a in func_node.args.args if a.arg not in ("self", "cls")]
+        defaults = func_node.args.defaults
+        first_default_index = len(non_self) - len(defaults)
+
+        params = []  # list of {name, annotation, default}
+        for i, arg in enumerate(non_self):
+            default_node = None
+            if i >= first_default_index:
+                default_node = defaults[i - first_default_index]
+            params.append({
+                "name": arg.arg,
+                "annotation": arg.annotation,
+                "default": default_node,
+            })
+
+        has_defaults = any(p["default"] is not None for p in params)
+        return {"params": params, "uses_options": has_defaults}
+
+    def _resolve_to_positional(self, signature, call_node):
+        # Given a signature and a call's positional + keyword args, return
+        # a list of expression strings in parameter order. Positional args
+        # fill from the left; remaining slots are matched by keyword name;
+        # any still-unfilled slot uses the parameter's default expression.
+        params = signature["params"]
+        result = []
+        kwargs_by_name = {kw.arg: kw.value for kw in call_node.keywords}
+
+        for i, param in enumerate(params):
+            if i < len(call_node.args):
+                # Positional arg supplied for this slot.
+                result.append(self.emit_expr(call_node.args[i]))
+            elif param["name"] in kwargs_by_name:
+                result.append(self.emit_expr(kwargs_by_name[param["name"]]))
+            elif param["default"] is not None:
+                result.append(self.emit_expr(param["default"]))
+            else:
+                # No positional, no kwarg, no default — call is invalid.
+                # The discipline checker should have caught this; emit
+                # a TODO so it surfaces in the output.
+                result.append("/* TODO missing arg: " + param["name"] + " */")
+        return result
+
+    def _format_options_literal(self, signature, call_node):
+        # Build a Haxe object literal { name: value, ... } from the call's
+        # positional and keyword arguments, mapped against the signature's
+        # parameter names. Defaults are NOT inlined — the function's
+        # destructuring prelude applies them when the field is null.
+        params = signature["params"]
+        kwargs_by_name = {kw.arg: kw.value for kw in call_node.keywords}
+        pieces = []
+
+        for i, param in enumerate(params):
+            value = None
+            if i < len(call_node.args):
+                value = self.emit_expr(call_node.args[i])
+            elif param["name"] in kwargs_by_name:
+                value = self.emit_expr(kwargs_by_name[param["name"]])
+            # If neither positional nor kwarg was supplied, omit the field
+            # entirely — the prelude will use the default.
+            if value is not None:
+                pieces.append(param["name"] + ": " + value)
+        return "{ " + ", ".join(pieces) + " }"
+
+    def _lookup_signature(self, call_node):
+        # Determine which signature, if any, matches this call.
+        # Returns (signature, kind) where kind is "function", "constructor",
+        # "method", or None if not resolvable.
+        func = call_node.func
+        # ClassName(...) -> constructor
+        if isinstance(func, ast.Name) and self._looks_like_class_call(func):
+            cls = self.classes.get(func.id)
+            if cls is not None:
+                init = cls["method_signatures"].get("__init__")
+                if init is not None:
+                    return (init, "constructor", func.id)
+        # foo(...) -> module-level function
+        if isinstance(func, ast.Name):
+            sig = self.functions.get(func.id)
+            if sig is not None:
+                return (sig, "function", func.id)
+        # self.method(...) -> method on current class
+        if isinstance(func, ast.Attribute) \
+                and isinstance(func.value, ast.Name) \
+                and func.value.id == "self" \
+                and self.current_class_name is not None:
+            cls = self.classes.get(self.current_class_name)
+            if cls is not None:
+                sig = cls["method_signatures"].get(func.attr)
+                if sig is not None:
+                    return (sig, "method", func.attr)
+        return (None, None, None)
 
     def _is_override(self, class_name, method_name):
         # Walk up the inheritance chain looking for the method.
@@ -237,10 +358,78 @@ class HaxeEmitter:
             self._emit_method(node)
             return
         # Module-level function.
+        signature = self.functions.get(node.name)
+        if signature is not None and signature["uses_options"]:
+            self._emit_options_function(node, signature, type_name=self._options_typename(node.name))
+            return
+
         params = self._format_params(node.args)
         ret = self.emit_type(node.returns)
         self.line("function " + node.name + "(" + params + "):" + ret + " {")
         self.indent_level += 1
+        for stmt in node.body:
+            self.emit_stmt(stmt)
+        self.indent_level -= 1
+        self.line("}")
+        self.line("")
+
+    def _options_typename(self, function_name, class_name=None):
+        # FooOptions for module-level Foo. ClassNewOptions for __init__.
+        # ClassFooOptions for Class.foo().
+        if function_name == "__init__":
+            return class_name + "NewOptions"
+        if class_name is None:
+            return self._capitalize(function_name) + "Options"
+        return class_name + self._capitalize(function_name) + "Options"
+
+    def _capitalize(self, name):
+        if not name:
+            return name
+        return name[0].upper() + name[1:]
+
+    def _emit_options_typedef(self, signature, type_name):
+        # Emit a Haxe typedef from the parameters. Required params (no
+        # default) become required fields; defaulted params become
+        # optional (`?` prefix). Underscore prefixes on parameter names
+        # are not stripped here — parameters aren't visibility-bearing
+        # in the same way fields and methods are.
+        self.line("typedef " + type_name + " = {")
+        self.indent_level += 1
+        last = len(signature["params"]) - 1
+        for i, param in enumerate(signature["params"]):
+            optional = "?" if param["default"] is not None else ""
+            line = optional + param["name"] + ":" + self.emit_type(param["annotation"])
+            if i < last:
+                line += ","
+            self.line(line)
+        self.indent_level -= 1
+        self.line("}")
+        self.line("")
+
+    def _emit_options_prelude(self, signature):
+        # For each parameter, emit a local `var name:Type = options.name`
+        # (or with default fallback for optional params). After the
+        # prelude, the rest of the body uses these locals just as if
+        # they were ordinary parameters.
+        for param in signature["params"]:
+            type_str = self.emit_type(param["annotation"])
+            name = param["name"]
+            if param["default"] is None:
+                self.line("var " + name + ":" + type_str + " = options." + name + ";")
+            else:
+                default_expr = self.emit_expr(param["default"])
+                self.line("var " + name + ":" + type_str +
+                          " = (options." + name + " != null) ? options." + name +
+                          " : " + default_expr + ";")
+
+    def _emit_options_function(self, node, signature, type_name):
+        # Top-level function variant: emit typedef, then function with a
+        # single options param, then the prelude, then the original body.
+        self._emit_options_typedef(signature, type_name)
+        ret = self.emit_type(node.returns)
+        self.line("function " + node.name + "(options:" + type_name + "):" + ret + " {")
+        self.indent_level += 1
+        self._emit_options_prelude(signature)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.indent_level -= 1
@@ -261,6 +450,15 @@ class HaxeEmitter:
             base = node.bases[0]
             if isinstance(base, ast.Name):
                 extends_clause = " extends " + base.id
+
+        # Emit typedefs for any methods that use options, before the
+        # class itself. Haxe typedefs live at module scope.
+        cls_info = self.classes.get(node.name)
+        if cls_info is not None:
+            for method_name, signature in cls_info["method_signatures"].items():
+                if signature["uses_options"]:
+                    typedef_name = self._options_typename(method_name, class_name=node.name)
+                    self._emit_options_typedef(signature, typedef_name)
 
         self.line("class " + node.name + extends_clause + " {")
         self.indent_level += 1
@@ -343,7 +541,20 @@ class HaxeEmitter:
         else:
             name = self._strip_private_underscores(node.name)
         ret = "Void" if is_init else self.emit_type(node.returns)
-        params = self._format_params(node.args)
+
+        # Look up the method's signature to decide between options-struct
+        # and positional form.
+        signature = None
+        cls_info = self.classes.get(self.current_class_name)
+        if cls_info is not None:
+            signature = cls_info["method_signatures"].get(node.name)
+        uses_options = signature is not None and signature["uses_options"]
+
+        if uses_options:
+            type_name = self._options_typename(node.name, class_name=self.current_class_name)
+            params = "options:" + type_name
+        else:
+            params = self._format_params(node.args)
 
         # Constructors and static methods can't be overrides; for the rest,
         # check the class registry for the same method name in any ancestor.
@@ -368,6 +579,10 @@ class HaxeEmitter:
         # are regular var declarations, not field declarations.
         prev_in_class = self.in_class
         self.in_class = False
+        # For options methods, emit the destructuring prelude first so
+        # the rest of the body can use the parameter names as locals.
+        if uses_options:
+            self._emit_options_prelude(signature)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
@@ -600,8 +815,7 @@ class HaxeEmitter:
                 and isinstance(node.func.value.func, ast.Name) \
                 and node.func.value.func.id == "super" \
                 and node.func.attr == "__init__":
-            args = [self.emit_expr(a) for a in node.args]
-            return "super(" + ", ".join(args) + ")"
+            return self._format_super_init_call(node)
 
         # Special case: len(x) -> x.length. Python builtin -> Haxe property.
         if isinstance(node.func, ast.Name) and node.func.id == "len" \
@@ -626,19 +840,57 @@ class HaxeEmitter:
             args = [self.emit_expr(a) for a in node.args]
             return receiver + "." + new_method + "(" + ", ".join(args) + ")"
 
+        # Signature-aware path: if we can resolve the called function in
+        # the registry, decide between options-struct form (function uses
+        # defaults) and positional form (no defaults).
+        signature, kind, _name = self._lookup_signature(node)
+        if signature is not None:
+            func = self.emit_expr(node.func)
+            if signature["uses_options"]:
+                literal = self._format_options_literal(signature, node)
+                if kind == "constructor":
+                    return "new " + func + "(" + literal + ")"
+                return func + "(" + literal + ")"
+            else:
+                resolved_args = self._resolve_to_positional(signature, node)
+                if kind == "constructor":
+                    return "new " + func + "(" + ", ".join(resolved_args) + ")"
+                return func + "(" + ", ".join(resolved_args) + ")"
+
+        # Unresolved fallback: emit positional args, mark any kwargs.
+        # External library calls land here, as do calls on local variables
+        # whose type we can't determine without type tracking.
         func = self.emit_expr(node.func)
         args = [self.emit_expr(a) for a in node.args]
-        # Kwargs are handled by Milestone 4; for now mark them.
         for kw in node.keywords:
             args.append("/*kwarg " + kw.arg + "=*/" + self.emit_expr(kw.value))
 
-        # Class instantiation: in Python, ClassName(...) is a call; in Haxe
-        # it must be written as `new ClassName(...)`. The disciplined-Python
-        # convention is that classes use capitalized names, so we use that
-        # as the heuristic. Module.Class also matches via the trailing name.
         if self._looks_like_class_call(node.func):
             return "new " + func + "(" + ", ".join(args) + ")"
         return func + "(" + ", ".join(args) + ")"
+
+    def _format_super_init_call(self, node):
+        # Look up the parent class's __init__ signature so we can resolve
+        # kwargs properly and pick options-struct vs positional form.
+        parent_sig = None
+        if self.current_class_name is not None:
+            cls = self.classes.get(self.current_class_name)
+            if cls is not None and cls["bases"]:
+                parent_name = cls["bases"][0]
+                parent = self.classes.get(parent_name)
+                if parent is not None:
+                    parent_sig = parent["method_signatures"].get("__init__")
+
+        if parent_sig is not None:
+            if parent_sig["uses_options"]:
+                literal = self._format_options_literal(parent_sig, node)
+                return "super(" + literal + ")"
+            resolved = self._resolve_to_positional(parent_sig, node)
+            return "super(" + ", ".join(resolved) + ")"
+
+        # Fallback for unresolvable parent (extern, missing scan, etc.)
+        args = [self.emit_expr(a) for a in node.args]
+        return "super(" + ", ".join(args) + ")"
 
     def _looks_like_class_call(self, func_node):
         # Match a bare Name where the identifier is capitalized: Counter()
