@@ -316,18 +316,32 @@ class HaxeEmitter:
     def _emit_extern_method_signature(self, node):
         is_static = self._has_decorator(node, "staticmethod")
         is_init = node.name == "__init__"
-        name = "new" if is_init else node.name
+        is_private = (not is_init) and self._is_private_name(node.name)
+        if is_init:
+            name = "new"
+        else:
+            name = self._strip_private_underscores(node.name)
         ret = "Void" if is_init else self.emit_type(node.returns)
         params = self._format_params(node.args)
 
-        prefix = "static function " if is_static else "function "
+        visibility = "private" if is_private else "public"
+        if is_static:
+            prefix = visibility + " static function "
+        else:
+            prefix = visibility + " function "
         self.line(prefix + name + "(" + params + "):" + ret + ";")
 
     def _emit_method(self, node):
         is_static = self._has_decorator(node, "staticmethod")
         is_init = node.name == "__init__"
-        name = "new" if is_init else node.name
+        is_private = (not is_init) and self._is_private_name(node.name)
         # __init__ has no return type annotation — Haxe constructors are Void.
+        # The emitted method name strips leading underscores (Haxe doesn't
+        # use the convention) and `private` carries the visibility.
+        if is_init:
+            name = "new"
+        else:
+            name = self._strip_private_underscores(node.name)
         ret = "Void" if is_init else self.emit_type(node.returns)
         params = self._format_params(node.args)
 
@@ -336,14 +350,17 @@ class HaxeEmitter:
         is_override = (not is_static) and (not is_init) and \
             self._is_override(self.current_class_name, node.name)
 
-        # Visibility modifier: public for everything by default; the
-        # discipline doesn't currently model private.
+        # Visibility modifier: explicit private for underscore-prefixed
+        # names, public otherwise. The discipline treats _foo and __foo
+        # the same way; both emit as `private`.
+        visibility = "private" if is_private else "public"
+
         if is_static:
-            prefix = "public static function "
+            prefix = visibility + " static function "
         elif is_override:
-            prefix = "override public function "
+            prefix = "override " + visibility + " function "
         else:
-            prefix = "public function "
+            prefix = visibility + " function "
 
         self.line(prefix + name + "(" + params + "):" + ret + " {")
         self.indent_level += 1
@@ -381,6 +398,21 @@ class HaxeEmitter:
                 return True
         return False
 
+    def _is_private_name(self, name):
+        # Python convention: leading underscore signals private. The
+        # discipline treats `_foo` and `__foo` the same way; double
+        # underscore in Python triggers name mangling but for our
+        # purposes both are just "not public".
+        # Dunders like __init__ are special and handled separately by
+        # the caller (they map to `new` and aren't private).
+        return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+
+    def _strip_private_underscores(self, name):
+        # `__foo` -> `foo`, `_foo` -> `foo`. Haxe doesn't use leading
+        # underscores for visibility, so we drop them and let the
+        # `private` modifier carry the meaning.
+        return name.lstrip("_")
+
     def _is_haxe_extern(self, node):
         for dec in node.decorator_list:
             if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name) \
@@ -399,9 +431,24 @@ class HaxeEmitter:
     def stmt_AnnAssign(self, node):
         target = self.emit_expr(node.target)
         type_str = self.emit_type(node.annotation)
-        # Inside a class body, this is a field declaration — Haxe needs
-        # `public var` for fields accessed from outside the class.
-        prefix = "public var " if self.in_class else "var "
+        # Inside a class body, this is a field declaration. Apply
+        # visibility based on the leading-underscore convention; outside
+        # a class, it's just a top-level var.
+        if self.in_class:
+            # Detect the raw field name on the AnnAssign target so we
+            # can check for the underscore prefix and strip it.
+            if isinstance(node.target, ast.Name):
+                raw_name = node.target.id
+                if self._is_private_name(raw_name):
+                    target = self._strip_private_underscores(raw_name)
+                    visibility = "private"
+                else:
+                    visibility = "public"
+            else:
+                visibility = "public"
+            prefix = visibility + " var "
+        else:
+            prefix = "var "
         if node.value is None:
             self.line(prefix + target + ":" + type_str + ";")
             return
@@ -603,7 +650,17 @@ class HaxeEmitter:
         return False
 
     def expr_Attribute(self, node):
-        return self.emit_expr(node.value) + "." + node.attr
+        receiver = self.emit_expr(node.value)
+        attr = node.attr
+        # Private methods/fields use leading-underscore in disciplined
+        # Python; the emitter strips the underscores and relies on the
+        # `private` visibility modifier on the declaration. Apply this
+        # only for self-references — stripping underscores from arbitrary
+        # external attributes would corrupt names from third-party APIs.
+        # Dunder attrs like __init__ are special and excluded.
+        if receiver == "this" and self._is_private_name(attr):
+            attr = self._strip_private_underscores(attr)
+        return receiver + "." + attr
 
     def expr_List(self, node):
         elements = [self.emit_expr(e) for e in node.elts]
