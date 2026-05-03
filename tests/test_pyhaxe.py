@@ -28,7 +28,8 @@ EXAMPLES = REPO_ROOT / "examples"
 def test_checker_passes_on_disciplined_examples():
     for filename in ["basic_example.py", "inventory_example.py",
                      "classes_example.py", "collections_example.py",
-                     "visibility_example.py", "kwargs_example.py"]:
+                     "visibility_example.py", "kwargs_example.py",
+                     "exceptions_example.py"]:
         violations = check_file(str(EXAMPLES / filename))
         assert violations == [], (
             filename + " should be clean but has " +
@@ -52,6 +53,9 @@ def test_checker_catches_violations_in_bad_example():
         "varargs",
         "kwargs-param",
         "yield",
+        "try-finally",
+        "try-else",
+        "bare-raise",
     }
 
     missing = expected_kinds - kinds
@@ -80,6 +84,10 @@ def test_emitter_produces_expected_output_for_visibility_example():
 
 def test_emitter_produces_expected_output_for_kwargs_example():
     _check_golden("kwargs_example")
+
+
+def test_emitter_produces_expected_output_for_exceptions_example():
+    _check_golden("exceptions_example")
 
 
 def _check_golden(stem):

@@ -96,12 +96,29 @@ class DisciplineChecker(ast.NodeVisitor):
 
     def visit_With(self, node: ast.With) -> None:
         self.report(node, "with-statement",
-                    "with statements have no Haxe equivalent; use try/finally pattern")
+                    "with statements have no Haxe equivalent; use explicit acquire/release")
         self.generic_visit(node)
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         self.report(node, "with-statement",
                     "async with not allowed")
+        self.generic_visit(node)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        # Haxe does not support try/finally or try/else.
+        if node.finalbody:
+            self.report(node, "try-finally",
+                        "try/finally has no Haxe equivalent; cleanup must be done in both paths")
+        if node.orelse:
+            self.report(node, "try-else",
+                        "try/else has no Haxe equivalent; move the else body after the try block")
+        self.generic_visit(node)
+
+    def visit_Raise(self, node: ast.Raise) -> None:
+        # Bare `raise` re-raises in Python; Haxe needs an explicit value.
+        if node.exc is None:
+            self.report(node, "bare-raise",
+                        "bare raise not allowed; use `raise e` with an explicit exception name")
         self.generic_visit(node)
 
     def visit_Yield(self, node: ast.Yield) -> None:

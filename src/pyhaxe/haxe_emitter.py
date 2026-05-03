@@ -26,8 +26,13 @@ Status:
     prelude); functions without defaults stay positional and call sites
     with kwargs are reordered to match parameter declaration order.
 
+    Milestone 5: exceptions. try/except/raise mapped to Haxe try/catch/throw,
+    with `Exception` mapping to `haxe.Exception`. Multiple catch handlers
+    chain correctly. Re-raise (`raise e`) translates to `throw e`. The
+    discipline checker flags try/finally, try/else, and bare `raise`
+    (none of which have clean Haxe equivalents).
+
 Future milestones (in order):
-    5. Try/except/raise
     6. Type system extensions — Optional, List, Dict -> Null, Array, Map
     7. Module/import system
     8. Polish — comments, formatting, error reporting
@@ -55,6 +60,8 @@ PYTHON_TO_HAXE_TYPES = {
     "float": "Float",
     "str": "String",
     "bool": "Bool",
+    # Python's built-in Exception maps to Haxe's recommended base class.
+    "Exception": "haxe.Exception",
 }
 
 GENERIC_TYPES = {
@@ -449,7 +456,8 @@ class HaxeEmitter:
         if node.bases:
             base = node.bases[0]
             if isinstance(base, ast.Name):
-                extends_clause = " extends " + base.id
+                base_name = PYTHON_TO_HAXE_TYPES.get(base.id, base.id)
+                extends_clause = " extends " + base_name
 
         # Emit typedefs for any methods that use options, before the
         # class itself. Haxe typedefs live at module scope.
@@ -758,6 +766,59 @@ class HaxeEmitter:
 
     def stmt_Continue(self, node):
         self.line("continue;")
+
+    def stmt_Try(self, node):
+        # Python try/except/else/finally -> Haxe try/catch.
+        # Haxe doesn't support `finally` or the `else` clause, so we
+        # detect those and emit a TODO comment. The discipline checker
+        # also flags them.
+        self.line("try {")
+        self.indent_level += 1
+        for stmt in node.body:
+            self.emit_stmt(stmt)
+        self.indent_level -= 1
+
+        # Each handler opens with `} catch (...)` (closing the previous
+        # block, opening its own); the very last one closes with `}`.
+        for handler in node.handlers:
+            self._emit_except_handler_open(handler)
+            self.indent_level += 1
+            for stmt in handler.body:
+                self.emit_stmt(stmt)
+            self.indent_level -= 1
+        if node.handlers:
+            self.line("}")
+        else:
+            self.line("}")
+
+        if node.orelse:
+            self.line("// TODO: try/else has no Haxe equivalent")
+        if node.finalbody:
+            self.line("// TODO: try/finally has no Haxe equivalent")
+
+    def _emit_except_handler_open(self, handler):
+        # Emit only the `} catch (...) {` line; the body and closing brace
+        # are managed by the caller.
+        if handler.type is None:
+            name = handler.name if handler.name else "_"
+            self.line("} catch (" + name + ") {")
+        else:
+            type_str = self.emit_type(handler.type)
+            name = handler.name if handler.name else "_"
+            self.line("} catch (" + name + ":" + type_str + ") {")
+
+    def stmt_Raise(self, node):
+        # `raise` (bare) — Python re-raises the current exception. The
+        # discipline requires the explicit form `raise e`, so a bare
+        # raise here means the lint missed something.
+        if node.exc is None:
+            self.line("/* TODO: bare raise has no Haxe equivalent; use `raise e` */")
+            return
+        # `raise SomeException("msg")` -> `throw new SomeException("msg")`.
+        # The expr_Call class-instantiation logic already adds `new` for
+        # capitalized names, so this works without special handling.
+        # `raise e` (re-raise a caught name) -> `throw e`. Also works.
+        self.line("throw " + self.emit_expr(node.exc) + ";")
 
     # === Expressions ===
 

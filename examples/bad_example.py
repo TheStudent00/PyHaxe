@@ -53,3 +53,14 @@ class BadClass(FirstBase, SecondBase):
     def stream(self) -> int:
         yield 1
         yield 2
+
+    # Violation: try-finally, try-else, bare-raise
+    def fragile(self) -> int:
+        try:
+            return 1
+        except Exception:
+            raise
+        else:
+            return 2
+        finally:
+            return 3
