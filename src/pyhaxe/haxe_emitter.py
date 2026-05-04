@@ -32,8 +32,15 @@ Status:
     discipline checker flags try/finally, try/else, and bare `raise`
     (none of which have clean Haxe equivalents).
 
+    Milestone 6: type system extensions and tuples. PEP 604 union syntax
+    (`X | None`, `X | Y`), `Union[A, B, C]`, `Optional[X]`, `Callable`,
+    `Any`, and `object` all map cleanly. Python tuples (`tuple[A, B]`,
+    `(a, b)` literals) are translated using auto-generated TupleN classes
+    emitted at module scope only for arities that appear in the source.
+    Tuple-typed variables get `t[0]` rewritten to `t._0` for typed access,
+    `t[i]` to `t.at(i)` for runtime indexing.
+
 Future milestones (in order):
-    6. Type system extensions — Optional, List, Dict -> Null, Array, Map
     7. Module/import system
     8. Polish — comments, formatting, error reporting
 
@@ -62,12 +69,19 @@ PYTHON_TO_HAXE_TYPES = {
     "bool": "Bool",
     # Python's built-in Exception maps to Haxe's recommended base class.
     "Exception": "haxe.Exception",
+    # Escape-hatch types — Python's Any and object both translate to
+    # Haxe's Dynamic (anything goes, type-checking suppressed).
+    "Any": "Dynamic",
+    "object": "Dynamic",
 }
 
 GENERIC_TYPES = {
     "List": "Array",
     "Optional": "Null",
     "Dict": "Map",
+    # Union[A, B] -> haxe.extern.EitherType<A, B>. Multi-arg unions
+    # nest left-to-right: Union[A, B, C] -> EitherType<A, EitherType<B, C>>.
+    "Union": "haxe.extern.EitherType",
 }
 
 BINOP_MAP = {
@@ -140,6 +154,16 @@ class HaxeEmitter:
         # Function registry: { function_name: signature }. Built alongside
         # classes; used for kwarg resolution at module-level call sites.
         self.functions = {}
+        # Tuple arities seen during emission. Each unique arity gets one
+        # generated TupleN class emitted at the top of the output.
+        # Tuples are heterogeneous fixed-length records; see development
+        # notes for the design rationale.
+        self.tuple_arities = set()
+        # Variable types tracked from annotated assignments and parameter
+        # declarations. Used to rewrite `t[0]` -> `t._0` for tuple-typed
+        # locals. Maps name -> (kind, arity) where kind is "tuple" or
+        # other future kinds. Module-scope only for now.
+        self.var_types = {}
 
     def line(self, text):
         self.lines.append("    " * self.indent_level + text)
@@ -170,18 +194,10 @@ class HaxeEmitter:
         if isinstance(node, ast.Name):
             return PYTHON_TO_HAXE_TYPES.get(node.id, node.id)
         if isinstance(node, ast.Subscript):
-            base = node.value.id if isinstance(node.value, ast.Name) else "?"
-            slice_node = node.slice
-            # Python <3.9 wrapped the slice in ast.Index; handle both for safety
-            if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
-                slice_node = slice_node.value
-            haxe_base = GENERIC_TYPES.get(base, base)
-            # Tuple slice -> multi-arg generic, e.g. Dict[K, V] -> Map<K, V>
-            if isinstance(slice_node, ast.Tuple):
-                inner_parts = [self.emit_type(elt) for elt in slice_node.elts]
-                return haxe_base + "<" + ", ".join(inner_parts) + ">"
-            inner = self.emit_type(slice_node)
-            return haxe_base + "<" + inner + ">"
+            return self._emit_subscript_type(node)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            # PEP 604 syntax: `X | None`, `X | Y`, etc.
+            return self._emit_union_binop(node)
         if isinstance(node, ast.Constant):
             # String forward-references like "Counter" or None for Void.
             if node.value is None:
@@ -189,6 +205,93 @@ class HaxeEmitter:
             if isinstance(node.value, str):
                 return PYTHON_TO_HAXE_TYPES.get(node.value, node.value)
         return "/* TODO type */"
+
+    def _emit_subscript_type(self, node):
+        base = node.value.id if isinstance(node.value, ast.Name) else "?"
+        slice_node = node.slice
+        # Python <3.9 wrapped the slice in ast.Index; handle both for safety
+        if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+            slice_node = slice_node.value
+
+        # tuple[A, B] / Tuple[A, B] — record arity and emit Tuple<N>.
+        if base in ("tuple", "Tuple"):
+            return self._emit_tuple_type(slice_node)
+
+        # Callable[[A, B], R] -> (A, B) -> R
+        if base == "Callable":
+            return self._emit_callable_type(slice_node)
+
+        # Union[A, B] / Union[A, B, C] -> EitherType nested binary.
+        if base == "Union":
+            elts = slice_node.elts if isinstance(slice_node, ast.Tuple) else [slice_node]
+            return self._emit_union_chain(elts)
+
+        haxe_base = GENERIC_TYPES.get(base, base)
+        # Tuple slice -> multi-arg generic, e.g. Dict[K, V] -> Map<K, V>
+        if isinstance(slice_node, ast.Tuple):
+            inner_parts = [self.emit_type(elt) for elt in slice_node.elts]
+            return haxe_base + "<" + ", ".join(inner_parts) + ">"
+        inner = self.emit_type(slice_node)
+        return haxe_base + "<" + inner + ">"
+
+    def _emit_tuple_type(self, slice_node):
+        # tuple[A, B, C] -> Tuple3<A, B, C>. Records the arity so the
+        # corresponding TupleN class gets emitted at module scope.
+        if isinstance(slice_node, ast.Tuple):
+            elts = slice_node.elts
+        else:
+            elts = [slice_node]
+        arity = len(elts)
+        self.tuple_arities.add(arity)
+        inner_parts = [self.emit_type(elt) for elt in elts]
+        return "Tuple" + str(arity) + "<" + ", ".join(inner_parts) + ">"
+
+    def _emit_callable_type(self, slice_node):
+        # Callable[[A, B], R]. The slice is a Tuple of (List of args, R).
+        if not isinstance(slice_node, ast.Tuple) or len(slice_node.elts) != 2:
+            return "/* TODO callable */"
+        args_node, return_node = slice_node.elts
+        if isinstance(args_node, ast.List):
+            arg_types = [self.emit_type(a) for a in args_node.elts]
+        else:
+            arg_types = []
+        ret_type = self.emit_type(return_node)
+        if not arg_types:
+            return "() -> " + ret_type
+        return "(" + ", ".join(arg_types) + ") -> " + ret_type
+
+    def _emit_union_binop(self, node):
+        # Flatten left-leaning chains: A | B | C is BinOp(BinOp(A, B), C).
+        elts = self._flatten_union_binop(node)
+        return self._emit_union_chain(elts)
+
+    def _flatten_union_binop(self, node):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return self._flatten_union_binop(node.left) + self._flatten_union_binop(node.right)
+        return [node]
+
+    def _emit_union_chain(self, elts):
+        # `X | None` is the Optional pattern -> Null<X>.
+        none_indices = [i for i, e in enumerate(elts) if self._is_none_constant(e)]
+        if len(elts) == 2 and none_indices:
+            other = elts[1 - none_indices[0]]
+            return "Null<" + self.emit_type(other) + ">"
+        # General union: nest right-associative as EitherType<A, EitherType<B, C>>.
+        return self._nest_either(elts)
+
+    def _nest_either(self, elts):
+        if len(elts) == 1:
+            return self.emit_type(elts[0])
+        if len(elts) == 2:
+            return ("haxe.extern.EitherType<" +
+                    self.emit_type(elts[0]) + ", " +
+                    self.emit_type(elts[1]) + ">")
+        return ("haxe.extern.EitherType<" +
+                self.emit_type(elts[0]) + ", " +
+                self._nest_either(elts[1:]) + ">")
+
+    def _is_none_constant(self, node):
+        return isinstance(node, ast.Constant) and node.value is None
 
     # === Module ===
 
@@ -198,8 +301,71 @@ class HaxeEmitter:
         # decide which functions take options structs.
         self._scan_classes(node)
         self._scan_functions(node)
+        # Emit the body into a separate list so we can prepend any
+        # auto-generated TupleN classes once we know which arities were
+        # actually used.
+        body_lines = []
+        saved = self.lines
+        self.lines = body_lines
         for stmt in node.body:
             self.emit_stmt(stmt)
+        self.lines = saved
+        # Now emit TupleN classes (if any), then the body.
+        self._emit_tuple_classes()
+        self.lines.extend(body_lines)
+
+    def _emit_tuple_classes(self):
+        # One generated TupleN class per arity used. Generic over its
+        # element types so a single class covers all type combinations.
+        # See development notes for the design rationale.
+        for arity in sorted(self.tuple_arities):
+            self._emit_one_tuple_class(arity)
+
+    def _emit_one_tuple_class(self, arity):
+        type_params = ", ".join("T" + str(i) for i in range(arity))
+        ctor_params = ", ".join("_" + str(i) + ":T" + str(i) for i in range(arity))
+        self.line("class Tuple" + str(arity) + "<" + type_params + "> {")
+        self.indent_level += 1
+        # Public fields _0, _1, ...
+        for i in range(arity):
+            self.line("public var _" + str(i) + ":T" + str(i) + ";")
+        # Lazy-initialized array for indexed access and iteration.
+        self.line("private var _items:Array<Dynamic>;")
+        # Constructor.
+        self.line("public function new(" + ctor_params + "):Void {")
+        self.indent_level += 1
+        for i in range(arity):
+            self.line("this._" + str(i) + " = _" + str(i) + ";")
+        self.indent_level -= 1
+        self.line("}")
+        # at(i) — runtime indexing, returns Dynamic.
+        self.line("public function at(i:Int):Dynamic {")
+        self.indent_level += 1
+        self.line("if (this._items == null) this._items = " +
+                  "[" + ", ".join("this._" + str(i) for i in range(arity)) + "];")
+        self.line("return this._items[i];")
+        self.indent_level -= 1
+        self.line("}")
+        # iterator() — Iterable<Dynamic> conformance.
+        self.line("public function iterator():Iterator<Dynamic> {")
+        self.indent_level += 1
+        self.line("if (this._items == null) this._items = " +
+                  "[" + ", ".join("this._" + str(i) for i in range(arity)) + "];")
+        self.line("return this._items.iterator();")
+        self.indent_level -= 1
+        self.line("}")
+        # equals(other) — structural equality.
+        self.line("public function equals(other:Tuple" + str(arity) +
+                  "<" + type_params + ">):Bool {")
+        self.indent_level += 1
+        comparisons = " && ".join("this._" + str(i) + " == other._" + str(i)
+                                  for i in range(arity))
+        self.line("return " + comparisons + ";")
+        self.indent_level -= 1
+        self.line("}")
+        self.indent_level -= 1
+        self.line("}")
+        self.line("")
 
     def _scan_classes(self, module_node):
         for stmt in module_node.body:
@@ -374,11 +540,24 @@ class HaxeEmitter:
         ret = self.emit_type(node.returns)
         self.line("function " + node.name + "(" + params + "):" + ret + " {")
         self.indent_level += 1
+        prev_var_types = dict(self.var_types)
+        self._register_param_var_types(node.args)
         for stmt in node.body:
             self.emit_stmt(stmt)
+        self.var_types = prev_var_types
         self.indent_level -= 1
         self.line("}")
         self.line("")
+
+    def _register_param_var_types(self, args):
+        # Add tuple-typed parameters to var_types so subscript access on
+        # them rewrites correctly inside the function body.
+        for arg in args.args:
+            if arg.arg in ("self", "cls"):
+                continue
+            arity = self._tuple_arity_of(arg.annotation)
+            if arity is not None:
+                self.var_types[arg.arg] = ("tuple", arity)
 
     def _options_typename(self, function_name, class_name=None):
         # FooOptions for module-level Foo. ClassNewOptions for __init__.
@@ -587,6 +766,9 @@ class HaxeEmitter:
         # are regular var declarations, not field declarations.
         prev_in_class = self.in_class
         self.in_class = False
+        prev_var_types = dict(self.var_types)
+        if not uses_options:
+            self._register_param_var_types(node.args)
         # For options methods, emit the destructuring prelude first so
         # the rest of the body can use the parameter names as locals.
         if uses_options:
@@ -594,6 +776,7 @@ class HaxeEmitter:
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
+        self.var_types = prev_var_types
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -654,6 +837,12 @@ class HaxeEmitter:
     def stmt_AnnAssign(self, node):
         target = self.emit_expr(node.target)
         type_str = self.emit_type(node.annotation)
+        # Track tuple-typed locals/fields so expr_Subscript can rewrite
+        # `t[0]` -> `t._0` when the index is a literal int.
+        if isinstance(node.target, ast.Name):
+            tuple_arity = self._tuple_arity_of(node.annotation)
+            if tuple_arity is not None:
+                self.var_types[node.target.id] = ("tuple", tuple_arity)
         # Inside a class body, this is a field declaration. Apply
         # visibility based on the leading-underscore convention; outside
         # a class, it's just a top-level var.
@@ -979,6 +1168,14 @@ class HaxeEmitter:
         elements = [self.emit_expr(e) for e in node.elts]
         return "[" + ", ".join(elements) + "]"
 
+    def expr_Tuple(self, node):
+        # Tuple literal in expression position -> new TupleN(...).
+        # Records the arity so the corresponding TupleN class is emitted.
+        arity = len(node.elts)
+        self.tuple_arities.add(arity)
+        elements = [self.emit_expr(e) for e in node.elts]
+        return "new Tuple" + str(arity) + "(" + ", ".join(elements) + ")"
+
     def expr_Dict(self, node):
         # Haxe map literal syntax: ["key" => value, ...]. Empty dicts
         # are ambiguous (Haxe needs a type hint to disambiguate from an
@@ -994,13 +1191,39 @@ class HaxeEmitter:
         # Used for both reading (x = arr[i]) and writing (arr[i] = x).
         # Same surface syntax in Haxe; the AST parent (Assign vs not)
         # determines which.
-        receiver = self.emit_expr(node.value)
         slice_node = node.slice
         # Python <3.9 wrapped the slice in ast.Index; handle both.
         if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
             slice_node = slice_node.value
+
+        # Tuple indexing: `t[0]` -> `t._0` when t is tuple-typed and the
+        # index is a literal int (the common case, fully typed). For
+        # variable indices on tuples, fall back to `t.at(i)` which
+        # returns Dynamic.
+        if isinstance(node.value, ast.Name):
+            var_info = self.var_types.get(node.value.id)
+            if var_info is not None and var_info[0] == "tuple":
+                receiver = self.emit_expr(node.value)
+                if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
+                    return receiver + "._" + str(slice_node.value)
+                return receiver + ".at(" + self.emit_expr(slice_node) + ")"
+
+        receiver = self.emit_expr(node.value)
         index = self.emit_expr(slice_node)
         return receiver + "[" + index + "]"
+
+    def _tuple_arity_of(self, type_node):
+        # Returns the arity if the annotation is a tuple type, else None.
+        if isinstance(type_node, ast.Subscript):
+            base = type_node.value.id if isinstance(type_node.value, ast.Name) else None
+            if base in ("tuple", "Tuple"):
+                slice_node = type_node.slice
+                if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                    slice_node = slice_node.value
+                if isinstance(slice_node, ast.Tuple):
+                    return len(slice_node.elts)
+                return 1
+        return None
 
 
 # ============================================================
