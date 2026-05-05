@@ -40,8 +40,15 @@ Status:
     Tuple-typed variables get `t[0]` rewritten to `t._0` for typed access,
     `t[i]` to `t.at(i)` for runtime indexing.
 
+    Milestone 7: modules and the Main wrapper. Free functions are hoisted
+    into a generated `Main` class as static methods. Calls to them from
+    inside Main use the bare name; calls from other classes get prefixed
+    with `Main.`. The `if __name__ == "__main__":` idiom is detected and
+    its body becomes `Main.main()`. typing/discipline imports are silently
+    dropped; other imports emit a placeholder comment until cross-file
+    analysis is added.
+
 Future milestones (in order):
-    7. Module/import system
     8. Polish — comments, formatting, error reporting
 
 Architecture:
@@ -164,6 +171,11 @@ class HaxeEmitter:
         # locals. Maps name -> (kind, arity) where kind is "tuple" or
         # other future kinds. Module-scope only for now.
         self.var_types = {}
+        # Names of free functions that get hoisted into the generated
+        # Main class. Calls to these from outside Main need to be
+        # qualified as Main.name; calls from inside Main can use the
+        # bare name.
+        self.main_functions = set()
 
     def line(self, text):
         self.lines.append("    " * self.indent_level + text)
@@ -301,18 +313,167 @@ class HaxeEmitter:
         # decide which functions take options structs.
         self._scan_classes(node)
         self._scan_functions(node)
-        # Emit the body into a separate list so we can prepend any
+
+        # Partition module body into:
+        #   decls            — classes and imports (stay at top level)
+        #   free_functions   — module-level def's (hoisted into Main)
+        #   main_body        — statements that should run on startup
+        # Haxe doesn't allow free statements or free functions at module
+        # scope, so the latter two get folded into a generated Main class.
+        decls, free_functions, main_body = self._partition_module_body(node.body)
+
+        # Track which functions are now Main static methods, so calls
+        # to them from inside Main can use the bare name.
+        self.main_functions = {f.name for f in free_functions}
+
+        # Emit declarations into a separate list so we can prepend any
         # auto-generated TupleN classes once we know which arities were
-        # actually used.
+        # actually used during emission.
         body_lines = []
         saved = self.lines
         self.lines = body_lines
-        for stmt in node.body:
+        for stmt in decls:
             self.emit_stmt(stmt)
         self.lines = saved
-        # Now emit TupleN classes (if any), then the body.
         self._emit_tuple_classes()
         self.lines.extend(body_lines)
+
+        # Generate Main class if it has any content (either free
+        # functions or main-body statements).
+        if free_functions or main_body:
+            self._emit_main_class(free_functions, main_body)
+
+    def _partition_module_body(self, body):
+        decls = []
+        free_functions = []
+        main_body = []
+        for stmt in body:
+            if self._is_module_docstring(stmt):
+                # Module docstrings are dropped entirely (same as Python
+                # would: they're available as __doc__ but don't execute).
+                continue
+            if isinstance(stmt, ast.FunctionDef):
+                # Free functions need a home in Haxe (no module-scope
+                # functions). We hoist them into Main as static methods.
+                free_functions.append(stmt)
+            elif isinstance(stmt, (ast.ClassDef, ast.Import, ast.ImportFrom)):
+                decls.append(stmt)
+            elif self._is_main_guard(stmt):
+                # Unwrap the body of `if __name__ == "__main__":` —
+                # those statements run on startup in Python, so they
+                # become Main.main() body.
+                main_body.extend(stmt.body)
+            else:
+                # Other free statements at module scope (rare in
+                # disciplined code, but possible) also go into main().
+                main_body.append(stmt)
+        return decls, free_functions, main_body
+
+    def _is_module_docstring(self, stmt):
+        return (isinstance(stmt, ast.Expr) and
+                isinstance(stmt.value, ast.Constant) and
+                isinstance(stmt.value.value, str))
+
+    def _is_declaration(self, stmt):
+        # Declarations stay at top level. Imports are kept here too;
+        # stmt_Import / stmt_ImportFrom decide what to do with them.
+        return isinstance(stmt, (ast.ClassDef, ast.FunctionDef,
+                                 ast.Import, ast.ImportFrom))
+
+    def _is_main_guard(self, stmt):
+        # Detect `if __name__ == "__main__":` exactly. Anything else
+        # (including `if __name__ != "__main__":`) is just a regular if
+        # and stays out of this special handling.
+        if not isinstance(stmt, ast.If):
+            return False
+        test = stmt.test
+        if not isinstance(test, ast.Compare):
+            return False
+        if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+            return False
+        left = test.left
+        right = test.comparators[0]
+        is_dunder_name = (isinstance(left, ast.Name) and left.id == "__name__")
+        is_main_str = (isinstance(right, ast.Constant) and right.value == "__main__")
+        return is_dunder_name and is_main_str
+
+    def _emit_main_class(self, free_functions, main_body):
+        self.line("class Main {")
+        self.indent_level += 1
+        # Emit each free function as a static method.
+        prev_in_class = self.in_class
+        prev_class_name = self.current_class_name
+        self.in_class = True
+        self.current_class_name = "Main"
+        for func in free_functions:
+            self._emit_static_function_in_class(func)
+        # Then the main() entry point.
+        if main_body:
+            self.line("public static function main():Void {")
+            self.indent_level += 1
+            # Body emits in non-class context.
+            saved_in_class = self.in_class
+            self.in_class = False
+            for stmt in main_body:
+                self.emit_stmt(stmt)
+            self.in_class = saved_in_class
+            self.indent_level -= 1
+            self.line("}")
+        else:
+            # No main() body — still emit a stub so Haxe has an entry.
+            self.line("public static function main():Void {}")
+        self.in_class = prev_in_class
+        self.current_class_name = prev_class_name
+        self.indent_level -= 1
+        self.line("}")
+        self.line("")
+
+    def _emit_static_function_in_class(self, node):
+        # Emit a free function as a `public static function` inside the
+        # Main class. Reuses the regular module-function logic but with
+        # the static prefix and visibility forced.
+        signature = self.functions.get(node.name)
+        if signature is not None and signature["uses_options"]:
+            # Options-struct version. The typedef has already been
+            # emitted at the appropriate level (or will be — let's keep
+            # the options form working).
+            type_name = self._options_typename(node.name)
+            self._emit_options_typedef(signature, type_name)
+            ret = self.emit_type(node.returns)
+            self.line("public static function " + node.name +
+                      "(options:" + type_name + "):" + ret + " {")
+            self.indent_level += 1
+            # Body of the function emits in non-class context — locals
+            # inside should be plain var, not public var.
+            prev_in_class = self.in_class
+            self.in_class = False
+            prev_var_types = dict(self.var_types)
+            self._emit_options_prelude(signature)
+            for stmt in node.body:
+                self.emit_stmt(stmt)
+            self.in_class = prev_in_class
+            self.var_types = prev_var_types
+            self.indent_level -= 1
+            self.line("}")
+            self.line("")
+            return
+
+        params = self._format_params(node.args)
+        ret = self.emit_type(node.returns)
+        self.line("public static function " + node.name +
+                  "(" + params + "):" + ret + " {")
+        self.indent_level += 1
+        prev_in_class = self.in_class
+        self.in_class = False
+        prev_var_types = dict(self.var_types)
+        self._register_param_var_types(node.args)
+        for stmt in node.body:
+            self.emit_stmt(stmt)
+        self.in_class = prev_in_class
+        self.var_types = prev_var_types
+        self.indent_level -= 1
+        self.line("}")
+        self.line("")
 
     def _emit_tuple_classes(self):
         # One generated TupleN class per arity used. Generic over its
@@ -512,12 +673,32 @@ class HaxeEmitter:
 
     # === Statements ===
 
+    # Modules whose imports are tooling-only and should be silently
+    # dropped during emission. typing imports vanish (the type machinery
+    # is consumed during emission, not imported in Haxe). The discipline
+    # module provides @haxe_extern, also tooling-only. __future__ is
+    # Python-version compatibility, not relevant.
+    SILENT_IMPORT_MODULES = {"typing", "__future__", "discipline", "pyhaxe.discipline"}
+
     def stmt_ImportFrom(self, node):
-        # Imports are a later milestone; skip for now.
-        pass
+        # Drop typing/tooling imports silently.
+        if node.module in self.SILENT_IMPORT_MODULES:
+            return
+        # Other imports: emit a comment marking the spot. Cross-module
+        # analysis (resolving imported classes, generating proper Haxe
+        # `import` statements) is deferred — for now the user sees a
+        # placeholder showing what was imported.
+        names = ", ".join(self._format_alias(a) for a in node.names)
+        self.line("// import: from " + str(node.module) + " import " + names)
 
     def stmt_Import(self, node):
-        pass
+        names = ", ".join(self._format_alias(a) for a in node.names)
+        self.line("// import: import " + names)
+
+    def _format_alias(self, alias):
+        if alias.asname:
+            return alias.name + " as " + alias.asname
+        return alias.name
 
     def stmt_Expr(self, node):
         # Standalone expression as statement (docstring, side-effect call).
@@ -1026,7 +1207,10 @@ class HaxeEmitter:
         # Disciplined Python uses self for methods; map to Haxe this.
         if node.id == "self":
             return "this"
-        return node.id
+        # Names like `Exception` need to map to their Haxe equivalents
+        # when used as constructor calls (e.g., `raise Exception(...)`).
+        # The same map drives type-position translation.
+        return PYTHON_TO_HAXE_TYPES.get(node.id, node.id)
 
     def expr_BinOp(self, node):
         left = self.emit_expr(node.left)
@@ -1095,7 +1279,7 @@ class HaxeEmitter:
         # defaults) and positional form (no defaults).
         signature, kind, _name = self._lookup_signature(node)
         if signature is not None:
-            func = self.emit_expr(node.func)
+            func = self._format_call_func(node.func, kind)
             if signature["uses_options"]:
                 literal = self._format_options_literal(signature, node)
                 if kind == "constructor":
@@ -1110,7 +1294,7 @@ class HaxeEmitter:
         # Unresolved fallback: emit positional args, mark any kwargs.
         # External library calls land here, as do calls on local variables
         # whose type we can't determine without type tracking.
-        func = self.emit_expr(node.func)
+        func = self._format_call_func(node.func, None)
         args = [self.emit_expr(a) for a in node.args]
         for kw in node.keywords:
             args.append("/*kwarg " + kw.arg + "=*/" + self.emit_expr(kw.value))
@@ -1118,6 +1302,16 @@ class HaxeEmitter:
         if self._looks_like_class_call(node.func):
             return "new " + func + "(" + ", ".join(args) + ")"
         return func + "(" + ", ".join(args) + ")"
+
+    def _format_call_func(self, func_node, kind):
+        # When a free function is hoisted into the Main class, calls to
+        # it from outside Main need a `Main.` prefix. Calls from inside
+        # Main use the bare name (sibling static methods).
+        if isinstance(func_node, ast.Name) and func_node.id in self.main_functions:
+            if self.current_class_name != "Main":
+                return "Main." + func_node.id
+            return func_node.id
+        return self.emit_expr(func_node)
 
     def _format_super_init_call(self, node):
         # Look up the parent class's __init__ signature so we can resolve

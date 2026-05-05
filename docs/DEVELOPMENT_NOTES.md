@@ -132,3 +132,76 @@ Wrapper classes have target-specific implementations that the user maintains by 
 Haxe has a full AST API exposed through `haxe.macro.Expr` with an `ExprDef` enum that mirrors Python's `ast` node types nearly one-to-one (constants, binary ops, calls, fields, blocks, ifs, fors, whiles, try-expressions, throws, returns, breaks, etc.). There's also an `ExprTools` utility class with `iter`, `map`, and `toString` analogous to Python's `NodeVisitor` / `NodeTransformer`.
 
 A reorganization of PyHaxe along the lines of "Python AST → Haxe AST → Haxe code" is theoretically possible but would require porting `ExprTools.toString` to Python (since the Haxe printer is itself Haxe code, only available at macro time inside the Haxe compiler). Net effect is roughly 2-3x more code for the same functional output, and you lose the ability to inject things like TODO comments cleanly because they don't fit the AST schema. The current source-AST-to-text approach is the standard route taken by most production transpilers.
+
+
+## Tuple handling (planned for Milestone 6)
+
+### The static-typing tension
+
+Python tuples are fixed-length, ordered, heterogeneous, indexed-at-runtime collections. That last property — runtime indexing — fundamentally conflicts with static typing: `t[i]` where `i` is a runtime expression can't statically know which type comes back. Every statically typed language reaches the same conclusion and offers a workaround:
+
+- Rust: tuples can only be indexed by literal constants (`t.0`, `t.1`), not runtime expressions.
+- Haskell: tuples must be destructured with pattern matching, can't be indexed at all.
+- Java: no tuples; use a class.
+- C#: tuples are sugar over a generic class with `Item1`/`Item2` fields.
+- Haxe: no tuples; users typically define a class or use anonymous structures.
+
+So tuples in disciplined Python need a translation strategy that respects this. We considered three options: disallow tuple types entirely, emit `Array<Dynamic>` (loses per-element types), and emit anonymous structures with `_0`/`_1` field names. Each had rough edges.
+
+### The chosen approach: on-demand TupleN classes
+
+The transpiler generates `Tuple2`, `Tuple3`, etc. classes on the Haxe side as needed, based on the arities actually used in the source. A program using only 2-tuples and 3-tuples gets exactly `Tuple2` and `Tuple3` emitted; nothing else. This avoids the "decide ahead of time how many to ship" problem entirely.
+
+Generated form:
+
+```haxe
+class Tuple2<A, B> {
+    public var _0:A;
+    public var _1:B;
+    public function new(_0:A, _1:B):Void {
+        this._0 = _0;
+        this._1 = _1;
+    }
+}
+```
+
+Each TupleN is generic over its element types, so one class per arity covers all type combinations.
+
+### User-facing experience
+
+The user writes regular Python tuple syntax with no imports. The transpiler handles the translation:
+
+```python
+# User writes:
+def stats(values: List[float]) -> tuple[float, int]:
+    return (sum(values), len(values))
+
+result = stats([1.0, 2.0, 3.0])
+total = result[0]
+count = result[1]
+```
+
+```haxe
+// Transpiler emits:
+class Tuple2<A, B> { ... }
+
+function stats(values:Array<Float>):Tuple2<Float, Int> {
+    return new Tuple2(sum_helper(values), values.length);
+}
+
+var result = stats([1.0, 2.0, 3.0]);
+var total = result._0;
+var count = result._1;
+```
+
+### Implementation notes
+
+- During emission, every `Tuple` node and every `tuple[...]` annotation records its arity in `self.tuple_arities`. After the module body is emitted, walk the set and emit one TupleN class per unique arity.
+- TupleN classes are generic, so emit one per arity regardless of how many distinct element-type combinations the program uses.
+- Index access on a tuple-typed variable gets rewritten: `result[0]` → `result._0`. This requires light type tracking — annotated assignments and parameters tell us when a variable is tuple-typed; for those we rewrite indexing to field access. Index access on non-tuple types is unchanged.
+- For un-annotated tuple literals (e.g., `t = (1, "x")` with no type hint), we have two options: either require an annotation (and lint when missing), or emit `Tuple2<Dynamic, Dynamic>` and lose the type info. The first is stricter but in keeping with the discipline's "annotate everything" approach.
+
+### What this rules out
+
+- Tuple unpacking (`a, b = some_tuple`) is still forbidden by the existing discipline rule. Could be allowed as a future polish item by rewriting the unpacking into individual `_0`/`_1` assignments.
+- Iterating over a tuple's elements (`for x in tup:`) doesn't make sense statically and remains forbidden — the elements have different types, so the loop variable can't have a single type. The user defines a class with a list field if they want iteration.

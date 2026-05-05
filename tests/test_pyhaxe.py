@@ -94,6 +94,10 @@ def test_emitter_produces_expected_output_for_types_example():
     _check_golden("types_example")
 
 
+def test_emitter_produces_expected_output_for_inventory_example():
+    _check_golden("inventory_example")
+
+
 def _check_golden(stem):
     py_path = EXAMPLES / (stem + ".py")
     hx_path = EXAMPLES / (stem + ".hx")

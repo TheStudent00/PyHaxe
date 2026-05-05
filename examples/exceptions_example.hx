@@ -4,13 +4,6 @@ class ValidationError extends haxe.Exception {
 class StorageError extends haxe.Exception {
 }
 
-function parse_positive_int(value:Int):Int {
-    if (value <= 0) {
-        throw new ValidationError("not a positive integer");
-    }
-    return value;
-}
-
 class Repository {
     public var items:Array<String>;
     public function new():Void {
@@ -55,26 +48,37 @@ class Repository {
     
 }
 
-function find_or_default(repo:Repository, index:Int, default:String):String {
-    try {
-        return repo.get(index);
-    } catch (e:haxe.Exception) {
-        return default;
+class Main {
+    public static function parse_positive_int(value:Int):Int {
+        if (value <= 0) {
+            throw new ValidationError("not a positive integer");
+        }
+        return value;
     }
-}
-
-function validate_and_process(items:Array<String>):Int {
-    var successful:Int = 0;
-    for (item in items) {
+    
+    public static function find_or_default(repo:Repository, index:Int, default:String):String {
         try {
-            if (item == "fail") {
-                throw new ValidationError("explicit fail");
-            }
-            successful += 1;
-        } catch (e:ValidationError) {
-            successful += 0;
+            return repo.get(index);
+        } catch (e:haxe.Exception) {
+            return default;
         }
     }
-    return successful;
+    
+    public static function validate_and_process(items:Array<String>):Int {
+        var successful:Int = 0;
+        for (item in items) {
+            try {
+                if (item == "fail") {
+                    throw new ValidationError("explicit fail");
+                }
+                successful += 1;
+            } catch (e:ValidationError) {
+                successful += 0;
+            }
+        }
+        return successful;
+    }
+    
+    public static function main():Void {}
 }
 
