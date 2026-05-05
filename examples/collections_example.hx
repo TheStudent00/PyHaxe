@@ -44,14 +44,13 @@ class TodoList {
         }
         return result;
     }
-    
 }
 
 class Main {
     public static function make_squares(n:Int):Array<Int> {
         var result:Array<Int> = [];
         for (i in 0...n) {
-            result.push((i * i));
+            result.push(i * i);
         }
         return result;
     }

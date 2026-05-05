@@ -45,7 +45,6 @@ class Repository {
             return false;
         }
     }
-    
 }
 
 class Main {
@@ -73,6 +72,7 @@ class Main {
                 }
                 successful += 1;
             } catch (e:ValidationError) {
+                // log and continue
                 successful += 0;
             }
         }

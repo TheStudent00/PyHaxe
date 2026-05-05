@@ -1,7 +1,13 @@
+// ============================================================
+// Wrapper classes — explicit boundary for non-universal built-ins
+// ============================================================
 extern class Print {
     public static function line(message:String):Void;
 }
 
+// ============================================================
+// Domain classes — single inheritance shown via DiscountedItem
+// ============================================================
 typedef ItemNewOptions = {
     name:String,
     ?unit_price:Float,
@@ -22,7 +28,7 @@ class Item {
     }
     
     public function total_value():Float {
-        return (this.unit_price * this.quantity);
+        return this.unit_price * this.quantity;
     }
     
     public function restock(amount:Int):Void {
@@ -38,9 +44,8 @@ class Item {
     }
     
     public function describe():String {
-        return ((this.name + " x") + Std.string(this.quantity));
+        return this.name + " x" + Std.string(this.quantity);
     }
-    
 }
 
 typedef DiscountedItemNewOptions = {
@@ -62,19 +67,18 @@ class DiscountedItem extends Item {
     }
     
     public function effective_price():Float {
-        var multiplier:Float = (1.0 - (this.discount_percent / 100.0));
-        return (this.unit_price * multiplier);
+        var multiplier:Float = 1.0 - this.discount_percent / 100.0;
+        return this.unit_price * multiplier;
     }
     
     override public function total_value():Float {
-        return (this.effective_price() * this.quantity);
+        return this.effective_price() * this.quantity;
     }
     
     override public function describe():String {
-        var base:String = ((this.name + " x") + Std.string(this.quantity));
-        return (((base + " (-") + Std.string(this.discount_percent)) + "%)");
+        var base:String = this.name + " x" + Std.string(this.quantity);
+        return base + " (-" + Std.string(this.discount_percent) + "%)";
     }
-    
 }
 
 class Inventory {
@@ -120,9 +124,11 @@ class Inventory {
         }
         return result;
     }
-    
 }
 
+// ============================================================
+// Dispatch — kernel-style switch replacement
+// ============================================================
 class Commands {
     public var inventory:Inventory;
     public function new(inventory:Inventory):Void {
@@ -134,11 +140,11 @@ class Commands {
     }
     
     public function cmd_total():String {
-        return ("Total value: " + Std.string(this.inventory.total_value()));
+        return "Total value: " + Std.string(this.inventory.total_value());
     }
     
     public function cmd_count():String {
-        return ("Item count: " + Std.string(this.inventory.count()));
+        return "Item count: " + Std.string(this.inventory.count());
     }
     
     public function cmd_unknown():String {
@@ -146,6 +152,8 @@ class Commands {
     }
     
     public function execute(command:String):String {
+        // Value-keyed if/return chain replaces switch — translates to
+        // the same form in any target.
         if (command == "list") {
             return this.cmd_list();
         }
@@ -157,12 +165,16 @@ class Commands {
         }
         return this.cmd_unknown();
     }
-    
 }
 
 class Main {
     public static function run_demo():Void {
+        // ============================================================
+        // Demo
+        // ============================================================
         var inventory:Inventory = new Inventory();
+        // Mixed positional and keyword construction — both translate to
+        // positional Haxe calls when the converter is signature-aware.
         var apple:Item = new Item({ name: "apple", unit_price: 0.5, quantity: 100 });
         var bread:Item = new Item({ name: "bread", unit_price: 2.5, quantity: 20 });
         var cake:DiscountedItem = new DiscountedItem({ name: "cake", unit_price: 10.0, quantity: 5, discount_percent: 25.0 });
@@ -181,15 +193,17 @@ class Main {
         Print.line(commands.execute("nonsense"));
         var found:Null<Item> = inventory.find_by_name("apple");
         if (found != null) {
-            Print.line(("Found: " + found.describe()));
+            Print.line("Found: " + found.describe());
         }
+        // Try/except with a broad catch — Python-specific exception types
+        // don't survive translation cleanly.
         try {
             var missing:Null<Item> = inventory.find_by_name("widget");
             if (missing == null) {
                 throw new haxe.Exception("Item not found: widget");
             }
         } catch (e:haxe.Exception) {
-            Print.line(("Caught: " + Std.string(e)));
+            Print.line("Caught: " + Std.string(e));
         }
     }
     
