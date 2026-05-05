@@ -10,7 +10,7 @@ class Main {
         if (x == null) {
             return null;
         }
-        return (x * 2);
+        return x * 2;
     }
     
     public static function stringify(value:haxe.extern.EitherType<Int, String>):String {

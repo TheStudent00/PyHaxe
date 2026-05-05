@@ -38,6 +38,5 @@ class BankAccount {
     private function verify_pin(pin:Int):Bool {
         return pin == this.pin;
     }
-    
 }
 

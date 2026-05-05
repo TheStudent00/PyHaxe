@@ -1,6 +1,6 @@
 class Main {
     public static function add(a:Int, b:Int):Int {
-        var result:Int = (a + b);
+        var result:Int = a + b;
         return result;
     }
     
@@ -18,7 +18,7 @@ class Main {
         var result:String = "";
         var i:Int = 0;
         while (i < count) {
-            result = (result + text);
+            result = result + text;
             i += 1;
         }
         return result;
@@ -28,7 +28,7 @@ class Main {
         if (denominator == 0) {
             return 0.0;
         }
-        return (numerator / denominator);
+        return numerator / denominator;
     }
     
     public static function in_range(value:Int, low:Int, high:Int):Bool {
@@ -42,7 +42,7 @@ class Main {
     }
     
     public static function in_range_combined(value:Int, low:Int, high:Int):Bool {
-        return (value >= low && value <= high);
+        return value >= low && value <= high;
     }
     
     public static function main():Void {}

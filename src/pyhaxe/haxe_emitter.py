@@ -48,8 +48,13 @@ Status:
     dropped; other imports emit a placeholder comment until cross-file
     analysis is added.
 
-Future milestones (in order):
-    8. Polish — comments, formatting, error reporting
+    Milestone 8: polish. Precedence-aware parens (only emitted when
+    structurally required, so `a + b * c` stays paren-free). Trailing
+    blank lines before closing braces are post-processed away. Comments
+    extracted via tokenize and preserved in the output as `// ...` lines
+    (placement is line-based — comments inside function bodies appear in
+    the right spot; module-level comments may shift slightly when free
+    functions get hoisted into Main).
 
 Architecture:
     HaxeEmitter walks the AST. Statement methods (stmt_X) emit lines via
@@ -124,6 +129,38 @@ UNARYOP_MAP = {
     ast.Not: "!",
 }
 
+# Operator precedence — higher number binds tighter. Used to decide
+# when binary operations need parens. Values mirror standard precedence
+# in Python and Haxe (which agree on these). Anything not in the table
+# is treated as 0 (lowest), forcing parens.
+OPERATOR_PRECEDENCE = {
+    # Boolean operators (lowest binding).
+    ast.Or: 1,
+    ast.And: 2,
+    ast.Not: 3,  # Unary not
+    # Comparison operators.
+    ast.Eq: 4,
+    ast.NotEq: 4,
+    ast.Lt: 4,
+    ast.LtE: 4,
+    ast.Gt: 4,
+    ast.GtE: 4,
+    ast.Is: 4,
+    ast.IsNot: 4,
+    # Bitwise (also used for PEP 604 union types in annotations).
+    ast.BitOr: 5,
+    ast.BitAnd: 7,
+    # Arithmetic.
+    ast.Add: 10,
+    ast.Sub: 10,
+    ast.Mult: 11,
+    ast.Div: 11,
+    ast.Mod: 11,
+    # Unary minus / plus bind tighter than multiplication.
+    ast.USub: 12,
+    ast.UAdd: 12,
+}
+
 AUGASSIGN_MAP = {
     ast.Add: "+=",
     ast.Sub: "-=",
@@ -176,22 +213,92 @@ class HaxeEmitter:
         # qualified as Main.name; calls from inside Main can use the
         # bare name.
         self.main_functions = set()
+        # Comments extracted from the source via tokenize, sorted by
+        # (line, column). The emitter drains comments whose line is
+        # less than the next AST node's line, emitting them as `// ...`
+        # before the node. Set externally before emit_module is called.
+        self._comments = []
+        self._comment_idx = 0
+        # Highest line number we've emitted from. Tracks where we are
+        # in the source so we can decide which comments are "behind us"
+        # and should be emitted now.
+        self._emit_line = 0
+        # Stack of enclosing-operator precedences. emit_expr is called
+        # from many contexts; each operator pushes its own precedence
+        # before recursing into operands, so child operators can decide
+        # whether to wrap themselves in parens. Top of stack is the
+        # immediate parent's precedence; 0 means no operator context
+        # (statement-level expression — never needs outer parens).
+        self._prec_stack = [0]
 
     def line(self, text):
         self.lines.append("    " * self.indent_level + text)
 
     def output(self):
-        return "\n".join(self.lines)
+        # Strip trailing blank lines that appear immediately before a
+        # closing brace. These accumulate inside class bodies because
+        # each method emits a blank line after its `}` for spacing
+        # between methods, but the last method then leaves a hanging
+        # blank before the class's closing `}`. Cosmetic only.
+        cleaned = self._strip_blanks_before_close(self.lines)
+        return "\n".join(cleaned)
+
+    def _strip_blanks_before_close(self, lines):
+        # Walk the list and skip any blank line whose next non-blank line
+        # is a closing brace (`}` possibly indented).
+        result = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.strip() == "":
+                # Look ahead: if the next non-blank line closes a block,
+                # drop this blank.
+                j = i + 1
+                while j < len(lines) and lines[j].strip() == "":
+                    j += 1
+                if j < len(lines) and lines[j].strip() == "}":
+                    i += 1
+                    continue
+            result.append(line)
+            i += 1
+        return result
 
     # === Dispatch ===
 
     def emit_stmt(self, node):
+        # Drain any source comments that appear before this statement.
+        line = getattr(node, "lineno", None)
+        if line is not None:
+            self._drain_comments_before(line)
+            self._emit_line = line
         method = "stmt_" + type(node).__name__
         handler = getattr(self, method, None)
         if handler is None:
             self.line("// TODO stmt: " + type(node).__name__)
             return
         handler(node)
+
+    def _drain_comments_before(self, line):
+        # Emit all stored comments whose line number is < the given line.
+        # Comments on column 0 are standalone; comments at column > 0
+        # are inline (trailing) — for now both kinds get emitted as
+        # standalone `// ...` lines at the current indent.
+        while self._comment_idx < len(self._comments):
+            c_line, c_col, c_text = self._comments[self._comment_idx]
+            if c_line >= line:
+                return
+            # Strip the leading '#' and any single space.
+            body = c_text.lstrip("#").lstrip(" ")
+            self.line("// " + body)
+            self._comment_idx += 1
+
+    def _drain_remaining_comments(self):
+        # Emit any leftover comments after the last statement.
+        while self._comment_idx < len(self._comments):
+            _, _, c_text = self._comments[self._comment_idx]
+            body = c_text.lstrip("#").lstrip(" ")
+            self.line("// " + body)
+            self._comment_idx += 1
 
     def emit_expr(self, node):
         method = "expr_" + type(node).__name__
@@ -1213,31 +1320,59 @@ class HaxeEmitter:
         return PYTHON_TO_HAXE_TYPES.get(node.id, node.id)
 
     def expr_BinOp(self, node):
-        left = self.emit_expr(node.left)
-        right = self.emit_expr(node.right)
         op = BINOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO binop: " + type(node.op).__name__ + " */"
-        return "(" + left + " " + op + " " + right + ")"
+        my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
+        parent_prec = self._prec_stack[-1]
+        self._prec_stack.append(my_prec)
+        left = self.emit_expr(node.left)
+        right = self.emit_expr(node.right)
+        self._prec_stack.pop()
+        result = left + " " + op + " " + right
+        if parent_prec > my_prec:
+            return "(" + result + ")"
+        return result
 
     def expr_UnaryOp(self, node):
-        operand = self.emit_expr(node.operand)
         op = UNARYOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO unaryop */"
-        return op + operand
+        my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
+        parent_prec = self._prec_stack[-1]
+        self._prec_stack.append(my_prec)
+        operand = self.emit_expr(node.operand)
+        self._prec_stack.pop()
+        result = op + operand
+        if parent_prec > my_prec:
+            return "(" + result + ")"
+        return result
 
     def expr_BoolOp(self, node):
         op = BOOLOP_MAP[type(node.op)]
+        my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
+        parent_prec = self._prec_stack[-1]
+        self._prec_stack.append(my_prec)
         parts = [self.emit_expr(v) for v in node.values]
-        return "(" + (" " + op + " ").join(parts) + ")"
+        self._prec_stack.pop()
+        result = (" " + op + " ").join(parts)
+        if parent_prec > my_prec:
+            return "(" + result + ")"
+        return result
 
     def expr_Compare(self, node):
         # Disciplined Python doesn't use comparison chaining (a < b < c).
+        my_prec = OPERATOR_PRECEDENCE.get(type(node.ops[0]), 0)
+        parent_prec = self._prec_stack[-1]
+        self._prec_stack.append(my_prec)
         left = self.emit_expr(node.left)
         op = COMPARE_MAP[type(node.ops[0])]
         right = self.emit_expr(node.comparators[0])
-        return left + " " + op + " " + right
+        self._prec_stack.pop()
+        result = left + " " + op + " " + right
+        if parent_prec > my_prec:
+            return "(" + result + ")"
+        return result
 
     def expr_Call(self, node):
         # Special case: super().__init__(args) -> super(args).
@@ -1427,8 +1562,30 @@ class HaxeEmitter:
 def convert(source, filename="<input>"):
     tree = ast.parse(source, filename=filename)
     emitter = HaxeEmitter()
+    emitter._comments = _extract_comments(source)
     emitter.emit_module(tree)
+    emitter._drain_remaining_comments()
     return emitter.output()
+
+
+def _extract_comments(source):
+    # Use tokenize to pull out (line, col, text) for every comment in
+    # the source. ast.parse drops comments entirely, so this is the
+    # only way to recover them. Returned sorted by (line, col).
+    import tokenize
+    import io
+    comments = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.COMMENT:
+                comments.append((tok.start[0], tok.start[1], tok.string))
+    except tokenize.TokenizeError:
+        # Tokenizer can fail on malformed source; we fall back to
+        # an empty list rather than raising — the AST parse already
+        # succeeded so emission can continue without comments.
+        pass
+    comments.sort(key=lambda c: (c[0], c[1]))
+    return comments
 
 
 def main():

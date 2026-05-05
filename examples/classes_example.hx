@@ -29,7 +29,6 @@ class Counter {
     public static function make_default():Counter {
         return new Counter({  });
     }
-    
 }
 
 typedef BoundedCounterNewOptions = {
@@ -49,7 +48,7 @@ class BoundedCounter extends Counter {
     }
     
     override public function increment():Int {
-        var next_value:Int = (this.value + this.step);
+        var next_value:Int = this.value + this.step;
         if (next_value > this.maximum) {
             this.value = this.maximum;
         } else {
@@ -57,6 +56,5 @@ class BoundedCounter extends Counter {
         }
         return this.value;
     }
-    
 }
 
