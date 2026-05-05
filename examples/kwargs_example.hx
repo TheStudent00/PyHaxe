@@ -1,23 +1,3 @@
-function add(a:Int, b:Int):Int {
-    return (a + b);
-}
-
-typedef GreetOptions = {
-    name:String,
-    ?greeting:String,
-    ?excited:Bool
-}
-
-function greet(options:GreetOptions):String {
-    var name:String = options.name;
-    var greeting:String = (options.greeting != null) ? options.greeting : "Hello";
-    var excited:Bool = (options.excited != null) ? options.excited : false;
-    if (excited) {
-        return (((greeting + ", ") + name) + "!");
-    }
-    return ((greeting + ", ") + name);
-}
-
 typedef ItemNewOptions = {
     name:String,
     ?unit_price:Float,
@@ -63,15 +43,39 @@ class DiscountedItem extends Item {
     
 }
 
-function run():Int {
-    var sum_value:Int = add(3, 5);
-    var sum_value2:Int = add(3, 5);
-    var msg1:String = greet({ name: "Derick" });
-    var msg2:String = greet({ name: "Derick", excited: true });
-    var msg3:String = greet({ name: "Derick", excited: true });
-    var apple:Item = new Item({ name: "apple", unit_price: 0.5, quantity: 100 });
-    var bread:Item = new Item({ name: "bread", unit_price: 2.5, quantity: 20 });
-    var cake:DiscountedItem = new DiscountedItem({ name: "cake", unit_price: 10.0, quantity: 5, discount_percent: 25.0 });
-    return (sum_value + sum_value2);
+class Main {
+    public static function add(a:Int, b:Int):Int {
+        return (a + b);
+    }
+    
+    typedef GreetOptions = {
+        name:String,
+        ?greeting:String,
+        ?excited:Bool
+    }
+    
+    public static function greet(options:GreetOptions):String {
+        var name:String = options.name;
+        var greeting:String = (options.greeting != null) ? options.greeting : "Hello";
+        var excited:Bool = (options.excited != null) ? options.excited : false;
+        if (excited) {
+            return (((greeting + ", ") + name) + "!");
+        }
+        return ((greeting + ", ") + name);
+    }
+    
+    public static function run():Int {
+        var sum_value:Int = add(3, 5);
+        var sum_value2:Int = add(3, 5);
+        var msg1:String = greet({ name: "Derick" });
+        var msg2:String = greet({ name: "Derick", excited: true });
+        var msg3:String = greet({ name: "Derick", excited: true });
+        var apple:Item = new Item({ name: "apple", unit_price: 0.5, quantity: 100 });
+        var bread:Item = new Item({ name: "bread", unit_price: 2.5, quantity: 20 });
+        var cake:DiscountedItem = new DiscountedItem({ name: "cake", unit_price: 10.0, quantity: 5, discount_percent: 25.0 });
+        return (sum_value + sum_value2);
+    }
+    
+    public static function main():Void {}
 }
 

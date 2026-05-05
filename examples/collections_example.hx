@@ -47,19 +47,23 @@ class TodoList {
     
 }
 
-function make_squares(n:Int):Array<Int> {
-    var result:Array<Int> = [];
-    for (i in 0...n) {
-        result.push((i * i));
+class Main {
+    public static function make_squares(n:Int):Array<Int> {
+        var result:Array<Int> = [];
+        for (i in 0...n) {
+            result.push((i * i));
+        }
+        return result;
     }
-    return result;
-}
-
-function sum_range(start:Int, stop:Int):Int {
-    var total:Int = 0;
-    for (i in start...stop) {
-        total += i;
+    
+    public static function sum_range(start:Int, stop:Int):Int {
+        var total:Int = 0;
+        for (i in start...stop) {
+            total += i;
+        }
+        return total;
     }
-    return total;
+    
+    public static function main():Void {}
 }
 
