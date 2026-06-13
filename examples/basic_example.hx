@@ -1,4 +1,4 @@
-class Main {
+class BasicExample {
     public static function add(a:Int, b:Int):Int {
         var result:Int = a + b;
         return result;

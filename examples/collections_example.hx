@@ -46,7 +46,7 @@ class TodoList {
     }
 }
 
-class Main {
+class CollectionsExample {
     public static function make_squares(n:Int):Array<Int> {
         var result:Array<Int> = [];
         for (i in 0...n) {

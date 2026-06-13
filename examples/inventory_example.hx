@@ -167,7 +167,7 @@ class Commands {
     }
 }
 
-class Main {
+class InventoryExample {
     public static function run_demo():Void {
         // ============================================================
         // Demo
