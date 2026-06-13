@@ -161,6 +161,86 @@ def test_positive_string_truthiness_via_downcast_is_coerced():
 
 
 # ============================================================
+# Comprehensions / collections (Round 2)
+# ============================================================
+
+def test_list_comprehension_with_filter():
+    source = (
+        "def f(xs: list) -> list:\n"
+        "    return [x for x in xs if x > 0]\n"
+    )
+    out = convert(source, "<test>")
+    assert "[for (x in xs) if (x > 0) x]" in out, out
+
+
+def test_dict_comprehension_builds_map():
+    source = (
+        "def f(xs: list) -> dict:\n"
+        "    return {k: 0 for k in xs}\n"
+    )
+    out = convert(source, "<test>")
+    assert "new Map()" in out and ".set(k, 0)" in out, out
+
+
+def test_dict_get_with_default():
+    source = (
+        "def f(m: dict, k: str) -> int:\n"
+        "    return m.get(k, 0)\n"
+    )
+    out = convert(source, "<test>")
+    assert "m.exists(k) ? m.get(k) : 0" in out, out
+
+
+def test_sorted_with_key():
+    source = (
+        "def keyf(x: int) -> int:\n"
+        "    return x\n"
+        "def f(xs: list) -> list:\n"
+        "    return sorted(xs, key=keyf)\n"
+    )
+    out = convert(source, "<test>")
+    assert ".copy()" in out and ".sort(" in out and "Reflect.compare(keyf(" in out, out
+
+
+def test_max_two_args_and_iterable():
+    source = (
+        "def f(a: float, b: float, xs: list) -> float:\n"
+        "    c: float = max(a, b)\n"
+        "    d = max(xs)\n"
+        "    return c + d\n"
+    )
+    out = convert(source, "<test>")
+    assert "Math.max(a, b)" in out, out
+    assert "Lambda.fold(xs" in out, out
+
+
+def test_set_type_and_membership():
+    source = (
+        "def f(k: str) -> bool:\n"
+        "    seen: set = set()\n"
+        "    seen.add(k)\n"
+        "    return k in seen\n"
+    )
+    out = convert(source, "<test>")
+    assert "new Map()" in out, out
+    assert "seen.set(k, true)" in out, out
+    assert "seen.exists(k)" in out, out
+
+
+def test_map_values_iteration():
+    source = (
+        "def f(m: dict) -> int:\n"
+        "    total = 0\n"
+        "    for v in m.values():\n"
+        "        total = total + v\n"
+        "    return total\n"
+    )
+    out = convert(source, "<test>")
+    # Iterating a Haxe Map yields its values directly.
+    assert "for (v in m)" in out, out
+
+
+# ============================================================
 # CLI smoke test
 # ============================================================
 
