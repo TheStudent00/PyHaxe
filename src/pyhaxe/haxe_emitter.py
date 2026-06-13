@@ -80,7 +80,18 @@ PYTHON_TO_HAXE_TYPES = {
     "str": "String",
     "bool": "Bool",
     # Python's built-in Exception maps to Haxe's recommended base class.
+    # Common builtin exception subclasses have no Haxe equivalent, so they
+    # collapse to haxe.Exception too: `raise ValueError(msg)` becomes
+    # `throw new haxe.Exception(msg)` and `except ValueError` catches it.
     "Exception": "haxe.Exception",
+    "ValueError": "haxe.Exception",
+    "TypeError": "haxe.Exception",
+    "KeyError": "haxe.Exception",
+    "IndexError": "haxe.Exception",
+    "RuntimeError": "haxe.Exception",
+    "ArithmeticError": "haxe.Exception",
+    "ZeroDivisionError": "haxe.Exception",
+    "NotImplementedError": "haxe.Exception",
     # Escape-hatch types — Python's Any and object both translate to
     # Haxe's Dynamic (anything goes, type-checking suppressed).
     "Any": "Dynamic",
@@ -176,6 +187,28 @@ METHOD_RENAMES = {
     "append": "push",
 }
 
+# Python string methods that map to Haxe StringTools static functions.
+# Applied type-directed: `s.method(args)` -> `StringTools.fn(s, args)`
+# only when the receiver is a known string. Haxe's String has its own
+# toLowerCase/toUpperCase/indexOf/split, so those stay as method calls;
+# only the ones living on StringTools are rewritten here.
+STRINGTOOLS_METHODS = {
+    "strip": "trim",
+    "lstrip": "ltrim",
+    "rstrip": "rtrim",
+    "startswith": "startsWith",
+    "endswith": "endsWith",
+    "replace": "replace",
+}
+
+# Python string methods that map to a same-shape Haxe String method
+# under a different name (receiver stays the receiver).
+STRING_METHOD_RENAMES = {
+    "lower": "toLowerCase",
+    "upper": "toUpperCase",
+    "find": "indexOf",
+}
+
 
 # ============================================================
 # Emitter
@@ -221,6 +254,10 @@ class HaxeEmitter:
         # qualified as Main.name; calls from inside Main can use the
         # bare name.
         self.main_functions = set()
+        # Module-level constants/vars hoisted into Main as static fields.
+        # References from outside Main are qualified `Main.name`.
+        self.module_constants = set()
+        self._module_consts = []
         # Comments extracted from the source via tokenize, sorted by
         # (line, column). The emitter drains comments whose line is
         # less than the next AST node's line, emitting them as `// ...`
@@ -435,11 +472,24 @@ class HaxeEmitter:
         #   main_body        — statements that should run on startup
         # Haxe doesn't allow free statements or free functions at module
         # scope, so the latter two get folded into a generated Main class.
-        decls, free_functions, main_body = self._partition_module_body(node.body)
+        decls, free_functions, main_body, module_consts = self._partition_module_body(node.body)
 
         # Track which functions are now Main static methods, so calls
         # to them from inside Main can use the bare name.
         self.main_functions = {f.name for f in free_functions}
+        # Module-level constants/variables become static fields on Main.
+        # References to them from inside Main use the bare name; from other
+        # classes they are qualified `Main.name` (mirrors main_functions).
+        self.module_constants = set()
+        for stmt in module_consts:
+            name = self._module_const_name(stmt)
+            self.module_constants.add(name)
+            kind = self._type_kind_of(getattr(stmt, "annotation", None))
+            if kind is None:
+                kind = self._infer_value_kind(getattr(stmt, "value", None))
+            if kind is not None:
+                self.var_types[name] = kind
+        self._module_consts = module_consts
 
         # Emit declarations into a separate list so we can prepend any
         # auto-generated TupleN classes once we know which arities were
@@ -453,15 +503,16 @@ class HaxeEmitter:
         self._emit_tuple_classes()
         self.lines.extend(body_lines)
 
-        # Generate Main class if it has any content (either free
-        # functions or main-body statements).
-        if free_functions or main_body:
-            self._emit_main_class(free_functions, main_body)
+        # Generate Main class if it has any content (free functions,
+        # module-level constants, or main-body statements).
+        if free_functions or main_body or module_consts:
+            self._emit_main_class(free_functions, main_body, module_consts)
 
     def _partition_module_body(self, body):
         decls = []
         free_functions = []
         main_body = []
+        module_consts = []
         for stmt in body:
             if self._is_module_docstring(stmt):
                 # Module docstrings are dropped entirely (same as Python
@@ -473,6 +524,11 @@ class HaxeEmitter:
                 free_functions.append(stmt)
             elif isinstance(stmt, (ast.ClassDef, ast.Import, ast.ImportFrom)):
                 decls.append(stmt)
+            elif self._is_module_constant(stmt):
+                # Module-level `NAME: T = value` (or `NAME = value`) — a
+                # constant/global. Haxe has no module scope, so these become
+                # static fields on Main.
+                module_consts.append(stmt)
             elif self._is_main_guard(stmt):
                 # Unwrap the body of `if __name__ == "__main__":` —
                 # those statements run on startup in Python, so they
@@ -482,7 +538,21 @@ class HaxeEmitter:
                 # Other free statements at module scope (rare in
                 # disciplined code, but possible) also go into main().
                 main_body.append(stmt)
-        return decls, free_functions, main_body
+        return decls, free_functions, main_body, module_consts
+
+    def _module_const_name(self, stmt):
+        if isinstance(stmt, ast.AnnAssign):
+            return stmt.target.id
+        return stmt.targets[0].id
+
+    def _is_module_constant(self, stmt):
+        # A module-level assignment to a bare Name: `NAME: T = value`
+        # (AnnAssign) or `NAME = value` (Assign, single Name target).
+        if isinstance(stmt, ast.AnnAssign):
+            return isinstance(stmt.target, ast.Name)
+        if isinstance(stmt, ast.Assign):
+            return len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+        return False
 
     def _is_module_docstring(self, stmt):
         return (isinstance(stmt, ast.Expr) and
@@ -512,14 +582,20 @@ class HaxeEmitter:
         is_main_str = (isinstance(right, ast.Constant) and right.value == "__main__")
         return is_dunder_name and is_main_str
 
-    def _emit_main_class(self, free_functions, main_body):
+    def _emit_main_class(self, free_functions, main_body, module_consts=None):
         self.line("class Main {")
         self.indent_level += 1
-        # Emit each free function as a static method.
         prev_in_class = self.in_class
         prev_class_name = self.current_class_name
         self.in_class = True
         self.current_class_name = "Main"
+        # Module-level constants become public static fields, emitted first
+        # so methods and other classes can reference them as Main.NAME.
+        if module_consts:
+            for stmt in module_consts:
+                self._emit_module_constant(stmt)
+            self.line("")
+        # Emit each free function as a static method.
         for func in free_functions:
             self._emit_static_function_in_class(func)
         # Then the main() entry point.
@@ -542,6 +618,24 @@ class HaxeEmitter:
         self.indent_level -= 1
         self.line("}")
         self.line("")
+
+    def _emit_module_constant(self, stmt):
+        # Emit a module-level constant/global as a public static field on
+        # Main. Annotated form keeps its type; bare assignment lets Haxe
+        # infer from the initializer.
+        if isinstance(stmt, ast.AnnAssign):
+            name = stmt.target.id
+            type_str = self.emit_type(stmt.annotation)
+            if stmt.value is None:
+                self.line("public static var " + name + ":" + type_str + ";")
+            else:
+                value = self.emit_expr(stmt.value)
+                self.line("public static var " + name + ":" + type_str + " = " + value + ";")
+            return
+        # Plain Assign: NAME = value.
+        name = stmt.targets[0].id
+        value = self.emit_expr(stmt.value)
+        self.line("public static var " + name + " = " + value + ";")
 
     def _emit_static_function_in_class(self, node):
         # Emit a free function as a `public static function` inside the
@@ -698,7 +792,8 @@ class HaxeEmitter:
             })
 
         has_defaults = any(p["default"] is not None for p in params)
-        return {"params": params, "uses_options": has_defaults}
+        return {"params": params, "uses_options": has_defaults,
+                "returns": func_node.returns}
 
     def _resolve_to_positional(self, signature, call_node):
         # Given a signature and a call's positional + keyword args, return
@@ -922,6 +1017,16 @@ class HaxeEmitter:
                 # A slice of a str is still a str; an index of a str is a
                 # single-char str (Haxe charAt returns String).
                 return ("str",)
+        # Call to a known free function -> kind of its declared return type
+        # (e.g. `tokens = tokenize(text)` where tokenize -> List[Token]).
+        if isinstance(value_node, ast.Call) and isinstance(value_node.func, ast.Name):
+            sig = self.functions.get(value_node.func.id)
+            if sig is not None:
+                return self._type_kind_of(sig.get("returns"))
+        # String-op call result (s.strip(), s.charAt(...), ...).
+        sk = self._static_kind(value_node)
+        if sk is not None:
+            return sk
         return None
 
     def _options_typename(self, function_name, class_name=None):
@@ -1446,12 +1551,24 @@ class HaxeEmitter:
         # Disciplined Python uses self for methods; map to Haxe this.
         if node.id == "self":
             return "this"
+        # Module-level constants live as static fields on Main. References
+        # from other classes must be qualified `Main.NAME`; references from
+        # inside Main use the bare name (sibling static field).
+        if node.id in self.module_constants and self.current_class_name != "Main":
+            return "Main." + node.id
         # Names like `Exception` need to map to their Haxe equivalents
         # when used as constructor calls (e.g., `raise Exception(...)`).
         # The same map drives type-position translation.
         return PYTHON_TO_HAXE_TYPES.get(node.id, node.id)
 
     def expr_BinOp(self, node):
+        # printf-style string formatting (`"%g" % value`) has no operator
+        # form in Haxe. We map the common single-substitution numeric/string
+        # specifiers to Std.string of the operand — adequate for compact
+        # value rendering (the only use in the target code). A literal
+        # format with no conversion just passes through.
+        if isinstance(node.op, ast.Mod) and self._is_format_string(node.left):
+            return self._emit_string_format(node.left, node.right)
         op = BINOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO binop: " + type(node.op).__name__ + " */"
@@ -1466,7 +1583,99 @@ class HaxeEmitter:
             return "(" + result + ")"
         return result
 
+    def _is_format_string(self, node):
+        return (isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "%" in node.value)
+
+    def _emit_string_format(self, fmt_node, args_node):
+        # Translate `"...%spec..." % args` into Haxe string concatenation,
+        # substituting Std.string(arg) for each conversion. `args` may be a
+        # single value or a tuple of values. Width/precision/flags in the
+        # spec are dropped (Haxe has no printf in the standard library);
+        # this is sufficient for compact value rendering and is the
+        # disciplined fallback. A genuinely format-dependent case should be
+        # reworked on the Python side.
+        fmt = fmt_node.value
+        if isinstance(args_node, ast.Tuple):
+            args = list(args_node.elts)
+        else:
+            args = [args_node]
+        pieces = []
+        literal = ""
+        arg_i = 0
+        i = 0
+        n = len(fmt)
+        while i < n:
+            ch = fmt[i]
+            if ch == "%" and i + 1 < n:
+                nxt = fmt[i + 1]
+                if nxt == "%":
+                    literal += "%"
+                    i += 2
+                    continue
+                # Consume a (simplified) conversion specifier up to the
+                # type char, ignoring flags/width/precision.
+                j = i + 1
+                while j < n and fmt[j] not in "diouxXeEfFgGsrc":
+                    j += 1
+                if j < n and arg_i < len(args):
+                    if literal:
+                        pieces.append(self._haxe_str_literal(literal))
+                        literal = ""
+                    pieces.append("Std.string(" + self.emit_expr(args[arg_i]) + ")")
+                    arg_i += 1
+                    i = j + 1
+                    continue
+            literal += ch
+            i += 1
+        if literal:
+            pieces.append(self._haxe_str_literal(literal))
+        if not pieces:
+            return self._haxe_str_literal("")
+        return " + ".join(pieces)
+
+    def _haxe_str_literal(self, s):
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return '"' + escaped + '"'
+
+    def _static_kind(self, node):
+        # Best-effort kind of an expression node (str / array / map),
+        # used for type-directed truthiness and membership. Returns a kind
+        # tuple or None. Recognizes tracked names, literals, and the
+        # results of the string/collection operations we emit.
+        if isinstance(node, ast.Name):
+            return self.var_types.get(node.id)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return ("str",)
+        if isinstance(node, ast.List):
+            return ("array",)
+        if isinstance(node, ast.Dict):
+            return ("map",)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            # `s.strip()` -> str; `.charAt`/`.substring` -> str. These are
+            # the string ops the emitter produces.
+            if node.func.attr in ("strip", "lstrip", "rstrip", "lower",
+                                   "upper", "charAt", "substring", "substr"):
+                return ("str",)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            base = self.var_types.get(node.value.id)
+            if base is not None and base[0] == "str":
+                return ("str",)
+        return None
+
     def expr_UnaryOp(self, node):
+        # Type-directed truthiness for `not x`. Python `not s` / `not arr`
+        # is true when the value is None or empty; Haxe `!s` is a type error
+        # on String/Array. Map to an explicit null-or-empty test.
+        if isinstance(node.op, ast.Not):
+            kind = self._static_kind(node.operand)
+            if kind is not None and kind[0] in ("str", "array"):
+                inner = self.emit_expr(node.operand)
+                return "(" + inner + " == null || " + inner + ".length == 0)"
+            if kind is not None and kind[0] == "map":
+                inner = self.emit_expr(node.operand)
+                return "(" + inner + " == null)"
         op = UNARYOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO unaryop */"
@@ -1530,6 +1739,40 @@ class HaxeEmitter:
         if isinstance(node.func, ast.Name) and node.func.id == "str" \
                 and len(node.args) == 1:
             return "Std.string(" + self.emit_expr(node.args[0]) + ")"
+
+        # Numeric parses/casts: float(x) -> Std.parseFloat(Std.string(x))
+        # for strings, but disciplined code uses float(str). Std.parseFloat
+        # takes a String; int(x) -> Std.parseInt (also String-typed) or
+        # Std.int for float-to-int truncation. We map the common
+        # string-parse forms used by tokenizers.
+        if isinstance(node.func, ast.Name) and node.func.id == "float" \
+                and len(node.args) == 1:
+            return "Std.parseFloat(" + self.emit_expr(node.args[0]) + ")"
+        if isinstance(node.func, ast.Name) and node.func.id == "int" \
+                and len(node.args) == 1:
+            # int(s) where s is a known str -> parse; otherwise truncate.
+            arg = node.args[0]
+            if isinstance(arg, ast.Name) and self.var_types.get(arg.id) == ("str",):
+                return "Std.parseInt(" + self.emit_expr(arg) + ")"
+            return "Std.int(" + self.emit_expr(arg) + ")"
+
+        # Type-directed string methods on a known-string receiver.
+        if isinstance(node.func, ast.Attribute):
+            recv_kind = self._static_kind(node.func.value)
+            if recv_kind == ("str",):
+                attr = node.func.attr
+                if attr in STRINGTOOLS_METHODS:
+                    # StringTools.fn(receiver, args...)
+                    receiver = self.emit_expr(node.func.value)
+                    fn = STRINGTOOLS_METHODS[attr]
+                    args = [self.emit_expr(a) for a in node.args]
+                    all_args = [receiver] + args
+                    return "StringTools." + fn + "(" + ", ".join(all_args) + ")"
+                if attr in STRING_METHOD_RENAMES:
+                    receiver = self.emit_expr(node.func.value)
+                    args = [self.emit_expr(a) for a in node.args]
+                    return (receiver + "." + STRING_METHOD_RENAMES[attr] +
+                            "(" + ", ".join(args) + ")")
 
         # Method renames: list.append(x) -> list.push(x), etc. Applied
         # when the call is shaped like obj.method(args) and the method
