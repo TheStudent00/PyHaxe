@@ -1286,6 +1286,21 @@ class HaxeEmitter:
             return
         self.line(target + " " + op + " " + value + ";")
 
+    def _emit_block_body(self, body, extra_declared=None):
+        # Emit a nested block's statements under their own declared-var
+        # scope. Haxe `var` declarations are block-scoped: a name first
+        # bound inside this block must not leak to sibling blocks (so each
+        # gets its own `var`), but names from the enclosing scope are
+        # visible. We snapshot declared_vars on entry and restore on exit;
+        # `extra_declared` seeds names the block header introduces (e.g. a
+        # for-loop target, which Haxe declares implicitly).
+        saved = set(self.declared_vars)
+        if extra_declared:
+            self.declared_vars |= extra_declared
+        for stmt in body:
+            self.emit_stmt(stmt)
+        self.declared_vars = saved
+
     def stmt_If(self, node):
         self._emit_if_chain(node, False)
 
@@ -1294,8 +1309,7 @@ class HaxeEmitter:
         keyword = "} else if" if is_elif else "if"
         self.line(keyword + " (" + cond + ") {")
         self.indent_level += 1
-        for stmt in node.body:
-            self.emit_stmt(stmt)
+        self._emit_block_body(node.body)
         self.indent_level -= 1
 
         if not node.orelse:
@@ -1309,8 +1323,7 @@ class HaxeEmitter:
 
         self.line("} else {")
         self.indent_level += 1
-        for stmt in node.orelse:
-            self.emit_stmt(stmt)
+        self._emit_block_body(node.orelse)
         self.indent_level -= 1
         self.line("}")
 
@@ -1318,8 +1331,7 @@ class HaxeEmitter:
         cond = self.emit_expr(node.test)
         self.line("while (" + cond + ") {")
         self.indent_level += 1
-        for stmt in node.body:
-            self.emit_stmt(stmt)
+        self._emit_block_body(node.body)
         self.indent_level -= 1
         self.line("}")
 
@@ -1330,8 +1342,12 @@ class HaxeEmitter:
         iter_expr = self._format_for_iter(node.iter)
         self.line("for (" + target + " in " + iter_expr + ") {")
         self.indent_level += 1
-        for stmt in node.body:
-            self.emit_stmt(stmt)
+        # The loop variable is declared by the `for` header in Haxe, so
+        # reassignments to it inside the body must not re-emit `var`.
+        extra = set()
+        if isinstance(node.target, ast.Name):
+            extra.add(node.target.id)
+        self._emit_block_body(node.body, extra_declared=extra)
         self.indent_level -= 1
         self.line("}")
 
@@ -1367,8 +1383,7 @@ class HaxeEmitter:
         # also flags them.
         self.line("try {")
         self.indent_level += 1
-        for stmt in node.body:
-            self.emit_stmt(stmt)
+        self._emit_block_body(node.body)
         self.indent_level -= 1
 
         # Each handler opens with `} catch (...)` (closing the previous
@@ -1376,8 +1391,9 @@ class HaxeEmitter:
         for handler in node.handlers:
             self._emit_except_handler_open(handler)
             self.indent_level += 1
-            for stmt in handler.body:
-                self.emit_stmt(stmt)
+            # The caught name (`catch (e:...)`) is declared by the header.
+            extra = {handler.name} if handler.name else set()
+            self._emit_block_body(handler.body, extra_declared=extra)
             self.indent_level -= 1
         if node.handlers:
             self.line("}")
