@@ -56,6 +56,19 @@ Status:
     the right spot; module-level comments may shift slightly when free
     functions get hoisted into Main).
 
+    Milestone 9: type-directed strings & collections. Variable type
+    tracking (var_types) extended beyond tuples to record str / Array /
+    Map / class kinds from annotations, confident RHS inference, and
+    declared return types. Drives: str[i] -> charAt, str[a:b] ->
+    substring, arr[a:b] -> slice; `in`/`not in` membership (indexOf /
+    Lambda.has / Map.exists); type-directed truthiness (`not s` ->
+    null-or-empty test); string methods (strip -> StringTools.trim, etc).
+    Locals get `var` on first assignment with Haxe-correct block scoping.
+    Module-level constants become Main static fields. Builtin exceptions
+    (ValueError, ...) map to haxe.Exception. float()/int() parse helpers
+    and `"%g" % v` formatting. Tagged-union subclass field access and
+    returns route through casts (base.subfield -> (cast base).subfield).
+
 Architecture:
     HaxeEmitter walks the AST. Statement methods (stmt_X) emit lines via
     self.line(). Expression methods (expr_X) return strings. Type methods
@@ -1787,17 +1800,48 @@ class HaxeEmitter:
 
     def expr_Compare(self, node):
         # Disciplined Python doesn't use comparison chaining (a < b < c).
-        my_prec = OPERATOR_PRECEDENCE.get(type(node.ops[0]), 0)
+        op_type = type(node.ops[0])
+        # Membership: `x in container` / `x not in container`. Haxe has no
+        # `in` operator, so this is type-directed by the container (the
+        # right operand): String -> indexOf != -1, Array -> indexOf != -1,
+        # Map/Dict -> exists(key).
+        if op_type in (ast.In, ast.NotIn):
+            return self._emit_membership(node, op_type is ast.NotIn)
+        my_prec = OPERATOR_PRECEDENCE.get(op_type, 0)
         parent_prec = self._prec_stack[-1]
         self._prec_stack.append(my_prec)
         left = self.emit_expr(node.left)
-        op = COMPARE_MAP[type(node.ops[0])]
+        op = COMPARE_MAP[op_type]
         right = self.emit_expr(node.comparators[0])
         self._prec_stack.pop()
         result = left + " " + op + " " + right
         if parent_prec > my_prec:
             return "(" + result + ")"
         return result
+
+    def _emit_membership(self, node, negate):
+        # `elem (not) in container`. Emit type-directed on the container's
+        # kind. Falls back to Array/String indexOf form when the kind is
+        # unknown (the most common case for untyped collections).
+        container = node.comparators[0]
+        kind = self._static_kind(container)
+        # Operands need their own (high) precedence context so the produced
+        # call/comparison composes correctly with surrounding operators.
+        self._prec_stack.append(OPERATOR_PRECEDENCE.get(ast.Eq, 4))
+        elem_str = self.emit_expr(node.left)
+        cont_str = self.emit_expr(container)
+        self._prec_stack.pop()
+        if kind is not None and kind[0] == "map":
+            # Map membership tests the key set.
+            expr = cont_str + ".exists(" + elem_str + ")"
+            return "!" + expr if negate else expr
+        if kind is not None and kind[0] == "str":
+            # Substring search; -1 means absent.
+            cmp = "==" if negate else "!="
+            return cont_str + ".indexOf(" + elem_str + ") " + cmp + " -1"
+        # Array (known or default): indexOf-based membership.
+        cmp = "==" if negate else "!="
+        return cont_str + ".indexOf(" + elem_str + ") " + cmp + " -1"
 
     def expr_Call(self, node):
         # Special case: super().__init__(args) -> super(args).
