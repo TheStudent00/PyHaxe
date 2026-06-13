@@ -249,6 +249,10 @@ class HaxeEmitter:
         # name is seen and a bare assignment thereafter. Saved/restored at
         # each function boundary alongside var_types.
         self.declared_vars = set()
+        # Kind tuple of the current function's declared return type, used to
+        # insert a downcast when returning a base-typed value where a
+        # subclass is declared (tagged-union pattern). Set per body entry.
+        self._return_kind = None
         # Names of free functions that get hoisted into the generated
         # Main class. Calls to these from outside Main need to be
         # qualified as Main.name; calls from inside Main can use the
@@ -659,6 +663,7 @@ class HaxeEmitter:
             prev_var_types = dict(self.var_types)
             prev_declared = self.declared_vars
             self.declared_vars = set()
+            self._return_kind = self._type_kind_of(node.returns)
             self._emit_options_prelude(signature)
             for stmt in node.body:
                 self.emit_stmt(stmt)
@@ -680,6 +685,7 @@ class HaxeEmitter:
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
         self.declared_vars = set()
+        self._return_kind = self._type_kind_of(node.returns)
         self._register_param_var_types(node.args)
         for stmt in node.body:
             self.emit_stmt(stmt)
@@ -753,14 +759,27 @@ class HaxeEmitter:
                     bases.append(base.id)
             methods = set()
             method_signatures = {}
+            fields = set()
             for item in stmt.body:
                 if isinstance(item, ast.FunctionDef):
                     methods.add(item.name)
                     method_signatures[item.name] = self._build_signature(item)
+                    # Fields are also bound as `self.x = ...` in __init__.
+                    if item.name == "__init__":
+                        for sub in ast.walk(item):
+                            if isinstance(sub, ast.Assign):
+                                for tgt in sub.targets:
+                                    if isinstance(tgt, ast.Attribute) \
+                                            and isinstance(tgt.value, ast.Name) \
+                                            and tgt.value.id == "self":
+                                        fields.add(tgt.attr)
+                elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    fields.add(item.target.id)
             self.classes[stmt.name] = {
                 "bases": bases,
                 "methods": methods,
                 "method_signatures": method_signatures,
+                "fields": fields,
             }
 
     def _scan_functions(self, module_node):
@@ -887,6 +906,40 @@ class HaxeEmitter:
                 return True
         return False
 
+    def _class_has_member(self, class_name, attr):
+        # True if class_name or any ancestor declares attr as a field or
+        # method.
+        cls = self.classes.get(class_name)
+        if cls is None:
+            return False
+        if attr in cls["methods"] or attr in cls.get("fields", set()):
+            return True
+        for base_name in cls["bases"]:
+            if self._class_has_member(base_name, attr):
+                return True
+        return False
+
+    def _subclass_has_member(self, base_name, attr):
+        # True if any (transitive) subclass of base_name declares attr.
+        # Used to detect the tagged-union downcast idiom: a base-typed
+        # variable whose attr lives only on a subclass.
+        for name, info in self.classes.items():
+            if name == base_name:
+                continue
+            if attr in info["methods"] or attr in info.get("fields", set()):
+                if self._is_subclass_of(name, base_name):
+                    return True
+        return False
+
+    def _is_subclass_of(self, name, ancestor):
+        cls = self.classes.get(name)
+        if cls is None:
+            return False
+        for base_name in cls["bases"]:
+            if base_name == ancestor or self._is_subclass_of(base_name, ancestor):
+                return True
+        return False
+
     # === Statements ===
 
     # Modules whose imports are tooling-only and should be silently
@@ -940,6 +993,7 @@ class HaxeEmitter:
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
         self.declared_vars = set()
+        self._return_kind = self._type_kind_of(node.returns)
         self._register_param_var_types(node.args)
         for stmt in node.body:
             self.emit_stmt(stmt)
@@ -973,14 +1027,18 @@ class HaxeEmitter:
         arity = self._tuple_arity_of(type_node)
         if arity is not None:
             return ("tuple", arity)
-        # Bare `str` annotation (Name or forward-ref string constant).
+        # Bare `str`, or a known class name (Name or forward-ref string).
         if isinstance(type_node, ast.Name):
             if type_node.id == "str":
                 return ("str",)
+            if type_node.id in self.classes:
+                return ("class", type_node.id)
             return None
         if isinstance(type_node, ast.Constant) and isinstance(type_node.value, str):
             if type_node.value == "str":
                 return ("str",)
+            if type_node.value in self.classes:
+                return ("class", type_node.value)
             return None
         # Generic subscripts: List[...] -> array, Dict[...] -> map.
         if isinstance(type_node, ast.Subscript):
@@ -989,6 +1047,18 @@ class HaxeEmitter:
                 return ("array",)
             if base in ("Dict", "dict"):
                 return ("map",)
+            # Optional[Class] / Null[Class] -> the underlying class kind.
+            if base in ("Optional", "Null"):
+                slice_node = type_node.slice
+                if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                    slice_node = slice_node.value
+                return self._type_kind_of(slice_node)
+        # PEP 604 `Class | None` -> the underlying class kind.
+        if isinstance(type_node, ast.BinOp) and isinstance(type_node.op, ast.BitOr):
+            elts = self._flatten_union_binop(type_node)
+            non_none = [e for e in elts if not self._is_none_constant(e)]
+            if len(non_none) == 1:
+                return self._type_kind_of(non_none[0])
         return None
 
     def _infer_value_kind(self, value_node):
@@ -1094,6 +1164,7 @@ class HaxeEmitter:
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
         self.declared_vars = set()
+        self._return_kind = self._type_kind_of(node.returns)
         self._emit_options_prelude(signature)
         for stmt in node.body:
             self.emit_stmt(stmt)
@@ -1250,6 +1321,7 @@ class HaxeEmitter:
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
         self.declared_vars = set()
+        self._return_kind = self._type_kind_of(node.returns)
         if not uses_options:
             self._register_param_var_types(node.args)
         # For options methods, emit the destructuring prelude first so
@@ -1316,7 +1388,19 @@ class HaxeEmitter:
         if node.value is None:
             self.line("return;")
             return
-        self.line("return " + self.emit_expr(node.value) + ";")
+        expr = self.emit_expr(node.value)
+        # Tagged-union downcast on return: if the declared return type is a
+        # subclass but we're returning a base-typed value (narrowed via a
+        # `kind` check in Python), insert a typed cast so Haxe accepts it.
+        if self._return_kind is not None and self._return_kind[0] == "class" \
+                and isinstance(node.value, ast.Name):
+            val_info = self.var_types.get(node.value.id)
+            if val_info is not None and val_info[0] == "class":
+                ret_cls = self._return_kind[1]
+                val_cls = val_info[1]
+                if val_cls != ret_cls and self._is_subclass_of(ret_cls, val_cls):
+                    expr = "cast(" + expr + ", " + ret_cls + ")"
+        self.line("return " + expr + ";")
 
     def stmt_AnnAssign(self, node):
         target = self.emit_expr(node.target)
@@ -1866,6 +1950,20 @@ class HaxeEmitter:
         # Dunder attrs like __init__ are special and excluded.
         if receiver == "this" and self._is_private_name(attr):
             attr = self._strip_private_underscores(attr)
+        # Tagged-union downcast: disciplined Python models variants as a
+        # base class with a `kind` discriminator and per-variant subclasses
+        # carrying the extra fields, accessed after checking `kind`. Haxe's
+        # nominal typing rejects `base.subfield`. When the receiver is a
+        # variable of a known base class that does NOT declare this attr but
+        # a subclass does, route the access through an untyped cast so it
+        # resolves at runtime — matching the Python duck-typed access.
+        if isinstance(node.value, ast.Name):
+            var_info = self.var_types.get(node.value.id)
+            if var_info is not None and var_info[0] == "class":
+                cls_name = var_info[1]
+                if not self._class_has_member(cls_name, attr) \
+                        and self._subclass_has_member(cls_name, attr):
+                    return "(cast " + receiver + ")." + attr
         return receiver + "." + attr
 
     def expr_List(self, node):
