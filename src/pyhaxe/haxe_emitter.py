@@ -208,6 +208,14 @@ class HaxeEmitter:
         # locals. Maps name -> (kind, arity) where kind is "tuple" or
         # other future kinds. Module-scope only for now.
         self.var_types = {}
+        # Names already declared (with `var`) in the current function
+        # scope. Haxe — unlike Python — requires `var` on a local's first
+        # assignment but forbids redeclaration. Disciplined Python often
+        # annotates the first bind (an AnnAssign), but plain `name = value`
+        # first-binds also occur; stmt_Assign emits `var` the first time a
+        # name is seen and a bare assignment thereafter. Saved/restored at
+        # each function boundary alongside var_types.
+        self.declared_vars = set()
         # Names of free functions that get hoisted into the generated
         # Main class. Calls to these from outside Main need to be
         # qualified as Main.name; calls from inside Main can use the
@@ -555,11 +563,14 @@ class HaxeEmitter:
             prev_in_class = self.in_class
             self.in_class = False
             prev_var_types = dict(self.var_types)
+            prev_declared = self.declared_vars
+            self.declared_vars = set()
             self._emit_options_prelude(signature)
             for stmt in node.body:
                 self.emit_stmt(stmt)
             self.in_class = prev_in_class
             self.var_types = prev_var_types
+            self.declared_vars = prev_declared
             self.indent_level -= 1
             self.line("}")
             self.line("")
@@ -573,11 +584,14 @@ class HaxeEmitter:
         prev_in_class = self.in_class
         self.in_class = False
         prev_var_types = dict(self.var_types)
+        prev_declared = self.declared_vars
+        self.declared_vars = set()
         self._register_param_var_types(node.args)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
         self.var_types = prev_var_types
+        self.declared_vars = prev_declared
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -829,23 +843,86 @@ class HaxeEmitter:
         self.line("function " + node.name + "(" + params + "):" + ret + " {")
         self.indent_level += 1
         prev_var_types = dict(self.var_types)
+        prev_declared = self.declared_vars
+        self.declared_vars = set()
         self._register_param_var_types(node.args)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.var_types = prev_var_types
+        self.declared_vars = prev_declared
         self.indent_level -= 1
         self.line("}")
         self.line("")
 
     def _register_param_var_types(self, args):
-        # Add tuple-typed parameters to var_types so subscript access on
-        # them rewrites correctly inside the function body.
+        # Record each parameter's type kind in var_types so subscript,
+        # slice, and membership operators can branch on str vs Array vs
+        # Map vs tuple inside the function body.
         for arg in args.args:
             if arg.arg in ("self", "cls"):
                 continue
-            arity = self._tuple_arity_of(arg.annotation)
-            if arity is not None:
-                self.var_types[arg.arg] = ("tuple", arity)
+            # Parameters are already in scope — record them as declared so
+            # a reassignment in the body doesn't get a spurious `var`.
+            self.declared_vars.add(arg.arg)
+            kind = self._type_kind_of(arg.annotation)
+            if kind is not None:
+                self.var_types[arg.arg] = kind
+
+    def _type_kind_of(self, type_node):
+        # Map a type annotation to a tracked var-type kind tuple. Returns
+        # one of ("tuple", arity), ("str",), ("array",), ("map",) or None
+        # when the kind isn't one we branch on. Used to drive type-directed
+        # subscript/slice/membership emission.
+        if type_node is None:
+            return None
+        arity = self._tuple_arity_of(type_node)
+        if arity is not None:
+            return ("tuple", arity)
+        # Bare `str` annotation (Name or forward-ref string constant).
+        if isinstance(type_node, ast.Name):
+            if type_node.id == "str":
+                return ("str",)
+            return None
+        if isinstance(type_node, ast.Constant) and isinstance(type_node.value, str):
+            if type_node.value == "str":
+                return ("str",)
+            return None
+        # Generic subscripts: List[...] -> array, Dict[...] -> map.
+        if isinstance(type_node, ast.Subscript):
+            base = type_node.value.id if isinstance(type_node.value, ast.Name) else None
+            if base in ("List", "list"):
+                return ("array",)
+            if base in ("Dict", "dict"):
+                return ("map",)
+        return None
+
+    def _infer_value_kind(self, value_node):
+        # Best-effort kind inference for the right-hand side of an
+        # untyped assignment (`ch = text[i]`, `tokens = []`, ...). Only
+        # confident cases return a kind; everything else returns None so
+        # we don't mistrack. Used by stmt_Assign.
+        if value_node is None:
+            return None
+        # String literal -> str.
+        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+            return ("str",)
+        # List literal -> array.
+        if isinstance(value_node, ast.List):
+            return ("array",)
+        # Dict literal -> map.
+        if isinstance(value_node, ast.Dict):
+            return ("map",)
+        # `text[i]` where text is a known str yields a str (charAt result).
+        if isinstance(value_node, ast.Subscript) and isinstance(value_node.value, ast.Name):
+            base_kind = self.var_types.get(value_node.value.id)
+            if base_kind is not None and base_kind[0] == "str":
+                slice_node = value_node.slice
+                if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                    slice_node = slice_node.value
+                # A slice of a str is still a str; an index of a str is a
+                # single-char str (Haxe charAt returns String).
+                return ("str",)
+        return None
 
     def _options_typename(self, function_name, class_name=None):
         # FooOptions for module-level Foo. ClassNewOptions for __init__.
@@ -888,6 +965,12 @@ class HaxeEmitter:
         for param in signature["params"]:
             type_str = self.emit_type(param["annotation"])
             name = param["name"]
+            # The prelude binds each parameter as a local `var`; record it
+            # as declared and track its kind for type-directed emission.
+            self.declared_vars.add(name)
+            kind = self._type_kind_of(param["annotation"])
+            if kind is not None:
+                self.var_types[name] = kind
             if param["default"] is None:
                 self.line("var " + name + ":" + type_str + " = options." + name + ";")
             else:
@@ -903,9 +986,14 @@ class HaxeEmitter:
         ret = self.emit_type(node.returns)
         self.line("function " + node.name + "(options:" + type_name + "):" + ret + " {")
         self.indent_level += 1
+        prev_var_types = dict(self.var_types)
+        prev_declared = self.declared_vars
+        self.declared_vars = set()
         self._emit_options_prelude(signature)
         for stmt in node.body:
             self.emit_stmt(stmt)
+        self.var_types = prev_var_types
+        self.declared_vars = prev_declared
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -1055,6 +1143,8 @@ class HaxeEmitter:
         prev_in_class = self.in_class
         self.in_class = False
         prev_var_types = dict(self.var_types)
+        prev_declared = self.declared_vars
+        self.declared_vars = set()
         if not uses_options:
             self._register_param_var_types(node.args)
         # For options methods, emit the destructuring prelude first so
@@ -1065,6 +1155,7 @@ class HaxeEmitter:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
         self.var_types = prev_var_types
+        self.declared_vars = prev_declared
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -1125,12 +1216,16 @@ class HaxeEmitter:
     def stmt_AnnAssign(self, node):
         target = self.emit_expr(node.target)
         type_str = self.emit_type(node.annotation)
-        # Track tuple-typed locals/fields so expr_Subscript can rewrite
-        # `t[0]` -> `t._0` when the index is a literal int.
+        # Track the target's type kind (tuple / str / array / map) so
+        # expr_Subscript, slice handling, and membership tests can branch.
         if isinstance(node.target, ast.Name):
-            tuple_arity = self._tuple_arity_of(node.annotation)
-            if tuple_arity is not None:
-                self.var_types[node.target.id] = ("tuple", tuple_arity)
+            kind = self._type_kind_of(node.annotation)
+            if kind is not None:
+                self.var_types[node.target.id] = kind
+            # Record the declaration so a later plain reassignment of the
+            # same name emits a bare `name = ...` rather than a second `var`.
+            if not self.in_class:
+                self.declared_vars.add(node.target.id)
         # Inside a class body, this is a field declaration. Apply
         # visibility based on the leading-underscore convention; outside
         # a class, it's just a top-level var.
@@ -1157,9 +1252,30 @@ class HaxeEmitter:
 
     def stmt_Assign(self, node):
         # Disciplined Python single-target only.
-        target = self.emit_expr(node.targets[0])
+        # Track an inferred type kind for plain `name = value` assignments
+        # so subsequent subscript/slice/membership on the name can branch
+        # (e.g. `ch = text[i]` makes ch a str). Only confident inferences
+        # are recorded; ambiguous RHS leaves the name untracked.
+        target_node = node.targets[0]
+        is_new_local = False
+        if isinstance(target_node, ast.Name):
+            name = target_node.id
+            if name not in self.var_types:
+                kind = self._infer_value_kind(node.value)
+                if kind is not None:
+                    self.var_types[name] = kind
+            # A bare Name assignment outside a class body that hasn't been
+            # declared yet is a new local; Haxe needs `var`. Inside a class
+            # body, bare Names are field-ish and handled elsewhere, so only
+            # apply this in function/method scope (self.in_class is False
+            # while emitting bodies).
+            if not self.in_class and name not in self.declared_vars:
+                is_new_local = True
+                self.declared_vars.add(name)
+        target = self.emit_expr(target_node)
         value = self.emit_expr(node.value)
-        self.line(target + " = " + value + ";")
+        prefix = "var " if is_new_local else ""
+        self.line(prefix + target + " = " + value + ";")
 
     def stmt_AugAssign(self, node):
         target = self.emit_expr(node.target)
@@ -1525,21 +1641,56 @@ class HaxeEmitter:
         if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
             slice_node = slice_node.value
 
+        # Type-directed dispatch when we know the receiver's kind.
+        var_info = None
+        if isinstance(node.value, ast.Name):
+            var_info = self.var_types.get(node.value.id)
+        kind = var_info[0] if var_info is not None else None
+
+        # Slice node (`x[a:b]`). Haxe has no slice syntax: a str slice maps
+        # to String.substring(a, b) and an array slice to Array.slice(a, b).
+        if isinstance(slice_node, ast.Slice):
+            return self._emit_slice(node.value, slice_node, kind)
+
         # Tuple indexing: `t[0]` -> `t._0` when t is tuple-typed and the
         # index is a literal int (the common case, fully typed). For
         # variable indices on tuples, fall back to `t.at(i)` which
         # returns Dynamic.
-        if isinstance(node.value, ast.Name):
-            var_info = self.var_types.get(node.value.id)
-            if var_info is not None and var_info[0] == "tuple":
-                receiver = self.emit_expr(node.value)
-                if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
-                    return receiver + "._" + str(slice_node.value)
-                return receiver + ".at(" + self.emit_expr(slice_node) + ")"
+        if kind == "tuple":
+            receiver = self.emit_expr(node.value)
+            if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, int):
+                return receiver + "._" + str(slice_node.value)
+            return receiver + ".at(" + self.emit_expr(slice_node) + ")"
 
         receiver = self.emit_expr(node.value)
         index = self.emit_expr(slice_node)
+        # String element read: Haxe String has no array-read access, so
+        # `text[i]` becomes `text.charAt(i)`. Arrays and maps keep `[...]`.
+        if kind == "str":
+            return receiver + ".charAt(" + index + ")"
         return receiver + "[" + index + "]"
+
+    def _emit_slice(self, value_node, slice_node, kind):
+        # Translate `x[a:b]` to a Haxe call. str -> substring, array ->
+        # slice; both take (start, end) with end exclusive, matching
+        # Python. A `step` is not expressible in either call form.
+        if slice_node.step is not None:
+            return "/* TODO slice step */"
+        receiver = self.emit_expr(value_node)
+        lower = self.emit_expr(slice_node.lower) if slice_node.lower is not None else "0"
+        if kind == "str":
+            method = "substring"
+        elif kind == "array":
+            method = "slice"
+        else:
+            # Unknown receiver kind: substring is the safe default for the
+            # string-scanning code this targets; surface it as a TODO note
+            # so a genuinely-untyped slice is still visible.
+            method = "substring"
+        if slice_node.upper is not None:
+            upper = self.emit_expr(slice_node.upper)
+            return receiver + "." + method + "(" + lower + ", " + upper + ")"
+        return receiver + "." + method + "(" + lower + ")"
 
     def _tuple_arity_of(self, type_node):
         # Returns the arity if the annotation is a tuple type, else None.
