@@ -69,6 +69,17 @@ Status:
     and `"%g" % v` formatting. Tagged-union subclass field access and
     returns route through casts (base.subfield -> (cast base).subfield).
 
+    Cross-module imports (the roadmap's Milestone 8). The generated module
+    class is named after the source file (`constraint_eval.py` ->
+    `ConstraintEval`), not a hardcoded `Main`, so it doesn't collide when
+    several modules compile together. `import x` / `from x import y` emit
+    real Haxe `import X;` lines (hoisted above all declarations) and record
+    the mapping so qualified refs `x.func(...)` resolve to `X.func(...)` and
+    `from`-imported function/constant names resolve to `X.name`. Module
+    classes still emit a `main()` so any of them can serve as a `-main`
+    entry point. (The "Main wrapper" wording above is historical; the
+    wrapper class is now per-module-named.)
+
 Architecture:
     HaxeEmitter walks the AST. Statement methods (stmt_X) emit lines via
     self.line(). Expression methods (expr_X) return strings. Type methods
@@ -297,6 +308,27 @@ class HaxeEmitter:
         # immediate parent's precedence; 0 means no operator context
         # (statement-level expression — never needs outer parens).
         self._prec_stack = [0]
+        # Name of the generated module class that hosts free functions and
+        # module constants. Derived from the source filename (Milestone 8:
+        # `constraint_eval.py` -> `ConstraintEval`); defaults to "Main" when
+        # no filename is available (REPL / single-snippet use), preserving
+        # the historical single-file behaviour. `convert` sets this before
+        # emit_module runs.
+        self.module_class_name = "Main"
+        # Cross-module imports (Milestone 8).
+        #   imported_modules: { python_module_name: HaxeClassName } for
+        #     `import x` — so a qualified ref `x.func(...)` resolves to
+        #     `X.func(...)`.
+        #   imported_names:   { local_name: HaxeQualifiedRef } for
+        #     `from x import y [as z]` — so a bare `y`/`z` resolves to the
+        #     static `X.y` on the imported module class.
+        self.imported_modules = {}
+        self.imported_names = {}
+        # Haxe `import X;` lines collected during the decls pass. Haxe
+        # requires all imports to precede every type declaration, so they
+        # are buffered here and flushed at the very top of the output
+        # (before generated TupleN classes), not emitted inline.
+        self._haxe_imports = []
 
     def line(self, text):
         self.lines.append("    " * self.indent_level + text)
@@ -529,6 +561,11 @@ class HaxeEmitter:
         for stmt in decls:
             self.emit_stmt(stmt)
         self.lines = saved
+        # Haxe requires every `import` to precede all type declarations, so
+        # cross-module imports collected during the decls pass are flushed
+        # first (Milestone 8), then the generated TupleN classes, then the
+        # rest of the declarations.
+        self._emit_haxe_imports()
         self._emit_tuple_classes()
         self.lines.extend(body_lines)
 
@@ -612,12 +649,12 @@ class HaxeEmitter:
         return is_dunder_name and is_main_str
 
     def _emit_main_class(self, free_functions, main_body, module_consts=None):
-        self.line("class Main {")
+        self.line("class " + self.module_class_name + " {")
         self.indent_level += 1
         prev_in_class = self.in_class
         prev_class_name = self.current_class_name
         self.in_class = True
-        self.current_class_name = "Main"
+        self.current_class_name = self.module_class_name
         # Module-level constants become public static fields, emitted first
         # so methods and other classes can reference them as Main.NAME.
         if module_consts:
@@ -719,6 +756,17 @@ class HaxeEmitter:
         self.declared_vars = prev_declared
         self.indent_level -= 1
         self.line("}")
+        self.line("")
+
+    def _emit_haxe_imports(self):
+        # Emit buffered cross-module `import X;` lines at the top of the
+        # file (Haxe requires imports before any declaration). A module
+        # import brings the module's main type and its sibling types into
+        # scope by their short names.
+        if not self._haxe_imports:
+            return
+        for module_class in self._haxe_imports:
+            self.line("import " + module_class + ";")
         self.line("")
 
     def _emit_tuple_classes(self):
@@ -1041,16 +1089,59 @@ class HaxeEmitter:
         # Drop typing/tooling imports silently.
         if node.module in self.SILENT_IMPORT_MODULES:
             return
-        # Other imports: emit a comment marking the spot. Cross-module
-        # analysis (resolving imported classes, generating proper Haxe
-        # `import` statements) is deferred — for now the user sees a
-        # placeholder showing what was imported.
-        names = ", ".join(self._format_alias(a) for a in node.names)
-        self.line("// import: from " + str(node.module) + " import " + names)
+        # Cross-module `from x import y [as z]` (Milestone 8). The Python
+        # module `x` maps to a Haxe class `X` whose top-level functions /
+        # constants are statics. Each imported name binds:
+        #   - an UpperCamelCase name (a class) -> a top-level Haxe type
+        #     accessible bare (same classpath root package): no rewrite.
+        #   - a lowercase name (function / constant) -> `X.name`, a static
+        #     reference, recorded in imported_names so bare uses resolve.
+        # We emit a real `import X;` so the module class (and its sibling
+        # types) are in scope.
+        if node.module is None or node.level:
+            # Relative imports (`from . import x`) aren't modeled; mark them.
+            names = ", ".join(self._format_alias(a) for a in node.names)
+            self.line("// import: from " + str(node.module) + " import " + names)
+            return
+        module_class = self._module_to_class_name(node.module)
+        self._add_haxe_import(module_class)
+        for alias in node.names:
+            local = alias.asname or alias.name
+            if alias.name and alias.name[0].isupper():
+                # Imported class: top-level Haxe type, used bare. If aliased
+                # to a different name, fall back to a comment (Haxe `import
+                # X.Y as Z` needs the originating module type path, which we
+                # don't track here) — disciplined code rarely aliases types.
+                if alias.asname and alias.asname != alias.name:
+                    self.line("// import alias unsupported: " + alias.name +
+                              " as " + alias.asname)
+                continue
+            # Function/constant: bare local name resolves to `X.name`.
+            self.imported_names[local] = module_class + "." + alias.name
 
     def stmt_Import(self, node):
-        names = ", ".join(self._format_alias(a) for a in node.names)
-        self.line("// import: import " + names)
+        # Cross-module `import x [as y]` (Milestone 8). Register the module
+        # -> Haxe class mapping so qualified refs `x.func(...)` resolve to
+        # `X.func(...)` (see expr_Attribute), and emit a real Haxe import so
+        # the module class is in scope.
+        emitted = []
+        for alias in node.names:
+            if alias.name in self.SILENT_IMPORT_MODULES:
+                continue
+            module_class = self._module_to_class_name(alias.name)
+            local = alias.asname or alias.name
+            self.imported_modules[local] = module_class
+            emitted.append(module_class)
+        for module_class in emitted:
+            self._add_haxe_import(module_class)
+
+    def _add_haxe_import(self, module_class):
+        # Buffer an `import X;` (deduped) for emission at the top of the
+        # file. A module importing itself (rare) is skipped.
+        if module_class == self.module_class_name:
+            return
+        if module_class not in self._haxe_imports:
+            self._haxe_imports.append(module_class)
 
     def _format_alias(self, alias):
         if alias.asname:
@@ -1238,6 +1329,19 @@ class HaxeEmitter:
         if not name:
             return name
         return name[0].upper() + name[1:]
+
+    def _module_to_class_name(self, module_name):
+        # Map a Python module name to a Haxe class/module name (Milestone 8).
+        # snake_case -> UpperCamelCase: `constraint_eval` -> `ConstraintEval`,
+        # `editor_core` -> `EditorCore`. A dotted package path (`pkg.mod`)
+        # uses the final component. Names that are already valid Haxe type
+        # identifiers (start uppercase) are capitalized componentwise too so
+        # the mapping is idempotent for `ConstraintEval` -> `ConstraintEval`.
+        base = module_name.split(".")[-1]
+        parts = [p for p in base.split("_") if p]
+        if not parts:
+            return self._capitalize(base)
+        return "".join(self._capitalize(p) for p in parts)
 
     def _emit_options_typedef(self, signature, type_name):
         # Emit a Haxe typedef from the parameters. Required params (no
@@ -1827,8 +1931,12 @@ class HaxeEmitter:
         # Module-level constants live as static fields on Main. References
         # from other classes must be qualified `Main.NAME`; references from
         # inside Main use the bare name (sibling static field).
-        if node.id in self.module_constants and self.current_class_name != "Main":
-            return "Main." + node.id
+        if node.id in self.module_constants and self.current_class_name != self.module_class_name:
+            return self.module_class_name + "." + node.id
+        # `from x import y` binds a bare name to a static on another module's
+        # class (Milestone 8): rewrite the bare local name to `X.y`.
+        if node.id in self.imported_names:
+            return self.imported_names[node.id]
         # Names like `Exception` need to map to their Haxe equivalents
         # when used as constructor calls (e.g., `raise Exception(...)`).
         # The same map drives type-position translation.
@@ -2247,8 +2355,8 @@ class HaxeEmitter:
         # it from outside Main need a `Main.` prefix. Calls from inside
         # Main use the bare name (sibling static methods).
         if isinstance(func_node, ast.Name) and func_node.id in self.main_functions:
-            if self.current_class_name != "Main":
-                return "Main." + func_node.id
+            if self.current_class_name != self.module_class_name:
+                return self.module_class_name + "." + func_node.id
             return func_node.id
         return self.emit_expr(func_node)
 
@@ -2285,6 +2393,13 @@ class HaxeEmitter:
         return False
 
     def expr_Attribute(self, node):
+        # Cross-module qualified reference (Milestone 8): `module.func` /
+        # `module.CONST` where `module` was brought in via `import module`.
+        # Resolve to the capitalized Haxe module class: `ConstraintEval.func`.
+        # Done before emitting the receiver so the lowercase module name
+        # (an "unknown identifier" in Haxe) never reaches the output.
+        if isinstance(node.value, ast.Name) and node.value.id in self.imported_modules:
+            return self.imported_modules[node.value.id] + "." + node.attr
         receiver = self.emit_expr(node.value)
         attr = node.attr
         # Private methods/fields use leading-underscore in disciplined
@@ -2527,6 +2642,13 @@ class HaxeEmitter:
 def convert(source, filename="<input>"):
     tree = ast.parse(source, filename=filename)
     emitter = HaxeEmitter()
+    # Derive the module class name from the source filename (Milestone 8).
+    # `<input>` / no real path keeps the historical "Main" default so
+    # single-snippet conversions are unchanged.
+    import os
+    base = os.path.basename(filename)
+    if base and base not in ("<input>", "<string>") and base.endswith(".py"):
+        emitter.module_class_name = emitter._module_to_class_name(base[:-3])
     emitter._comments = _extract_comments(source)
     emitter.emit_module(tree)
     emitter._drain_remaining_comments()
