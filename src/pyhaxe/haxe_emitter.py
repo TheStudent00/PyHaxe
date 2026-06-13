@@ -324,6 +324,14 @@ class HaxeEmitter:
         #     static `X.y` on the imported module class.
         self.imported_modules = {}
         self.imported_names = {}
+        # Local names bound to a non-portable builtin module (e.g. `random`),
+        # whose member calls are rewritten inline rather than via a class.
+        self.builtin_module_aliases = {}
+        # Directory of the source file, used to locate sibling .py modules
+        # for cross-module type-info scanning (so imported classes' field
+        # and method types drive type-directed emission). None disables it
+        # (REPL/string input).
+        self._source_dir = None
         # Haxe `import X;` lines collected during the decls pass. Haxe
         # requires all imports to precede every type declaration, so they
         # are buffered here and flushed at the very top of the output
@@ -523,7 +531,10 @@ class HaxeEmitter:
     def emit_module(self, node):
         # First pass: build the class and function registries so emission
         # can detect method overrides, resolve kwargs to positional, and
-        # decide which functions take options structs.
+        # decide which functions take options structs. Imported sibling
+        # modules are scanned first (for cross-module type info), then the
+        # local module — so a local definition always wins on name clash.
+        self._scan_imported_modules(node)
         self._scan_classes(node)
         self._scan_functions(node)
 
@@ -822,6 +833,51 @@ class HaxeEmitter:
         self.line("}")
         self.line("")
 
+    def _scan_imported_modules(self, module_node):
+        # Cross-module type info: for each `import x` / `from x import ...`,
+        # locate the sibling `x.py` and scan its classes and free functions
+        # into our registries. This is type-info only (no emission); it lets
+        # type-directed logic (truthiness, .values()/.keys(), subscript,
+        # membership, return-kind inference, constructor `new`) work on types
+        # defined in another module. Without it, an imported field/param like
+        # `state.nodes: Dict[...]` or `node.expr_left: str` is invisible and
+        # mis-emits. Failures (missing file, parse error) are ignored — the
+        # emitter degrades to the prior behavior for that module.
+        if not self._source_dir:
+            return
+        import os
+        modules = set()
+        for stmt in module_node.body:
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    if alias.name not in self.SILENT_IMPORT_MODULES \
+                            and alias.name not in self.BUILTIN_MODULES:
+                        modules.add(alias.name)
+            elif isinstance(stmt, ast.ImportFrom):
+                if stmt.module and not stmt.level \
+                        and stmt.module not in self.SILENT_IMPORT_MODULES \
+                        and stmt.module not in self.BUILTIN_MODULES:
+                    modules.add(stmt.module)
+        for mod in modules:
+            path = os.path.join(self._source_dir, mod.replace(".", os.sep) + ".py")
+            if not os.path.isfile(path):
+                continue
+            try:
+                f = open(path, "r")
+                try:
+                    src = f.read()
+                finally:
+                    f.close()
+                imported_tree = ast.parse(src, filename=path)
+            except (OSError, SyntaxError):
+                continue
+            # Only register types/signatures; do not recurse emission or
+            # transitively pull in their imports (we want the directly named
+            # module's surface). Local definitions are scanned afterward and
+            # overwrite on clash.
+            self._scan_classes(imported_tree)
+            self._scan_functions(imported_tree)
+
     def _scan_classes(self, module_node):
         for stmt in module_node.body:
             if not isinstance(stmt, ast.ClassDef):
@@ -992,6 +1048,15 @@ class HaxeEmitter:
             sig = cls["method_signatures"].get(func.attr)
             if sig is not None:
                 return (sig, "method", func.attr)
+        # module.func(...) -> free function in an imported module (Milestone
+        # 8 type-loading). The module's free functions were scanned into
+        # self.functions; resolve by name so return-type/kwarg info is known.
+        if isinstance(func, ast.Attribute) \
+                and isinstance(func.value, ast.Name) \
+                and func.value.id in self.imported_modules:
+            sig = self.functions.get(func.attr)
+            if sig is not None:
+                return (sig, "function", func.attr)
         return (None, None, None)
 
     def _is_override(self, class_name, method_name):
@@ -1085,6 +1150,16 @@ class HaxeEmitter:
     # Python-version compatibility, not relevant.
     SILENT_IMPORT_MODULES = {"typing", "__future__", "discipline", "pyhaxe.discipline"}
 
+    # Non-portable Python stdlib modules with no 1:1 Haxe class. Their
+    # imports are dropped (no `import Random;`) and their member calls are
+    # rewritten inline to Haxe-native equivalents in expr_Call (see
+    # _emit_builtin_module_call). This is a pragmatic, hard-coded stopgap;
+    # the principled replacement is the @haxe_extern wrapper story
+    # (Milestone 4) — a disciplined `random.py` wrapper marked @haxe_extern
+    # whose backend is hand-written Haxe. The same wrapper mechanism is how
+    # GUI4GUI's own kit @haxe_extern backend plugs in.
+    BUILTIN_MODULES = {"random"}
+
     def stmt_ImportFrom(self, node):
         # Drop typing/tooling imports silently.
         if node.module in self.SILENT_IMPORT_MODULES:
@@ -1127,6 +1202,12 @@ class HaxeEmitter:
         emitted = []
         for alias in node.names:
             if alias.name in self.SILENT_IMPORT_MODULES:
+                continue
+            if alias.name in self.BUILTIN_MODULES:
+                # Non-portable stdlib: no Haxe import; record the local name
+                # so `random.fn(...)` is rewritten inline (expr_Call).
+                local = alias.asname or alias.name
+                self.builtin_module_aliases[local] = alias.name
                 continue
             module_class = self._module_to_class_name(alias.name)
             local = alias.asname or alias.name
@@ -1195,6 +1276,7 @@ class HaxeEmitter:
         self.declared_vars = set()
         self._return_kind = self._type_kind_of(node.returns)
         self._register_param_var_types(node.args)
+        self._hoist_branch_locals(node.body)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.var_types = prev_var_types
@@ -1202,6 +1284,56 @@ class HaxeEmitter:
         self.indent_level -= 1
         self.line("}")
         self.line("")
+
+    def _hoist_branch_locals(self, body):
+        # Python lets a name first-bound inside an if/try/for/while branch be
+        # read after that block; Haxe's `var` is block-scoped, so such a name
+        # would be undefined at the read site. Detect names that are
+        # *only* assigned inside nested branches of this body (never bound at
+        # the body's own top level) yet read somewhere at this level, and
+        # emit a leading `var name;` so the branch assignments populate one
+        # enclosing binding. We then mark them declared so the in-branch
+        # assignment emits without a (shadowing) `var`. Conservative: only
+        # plain `name = ...` targets are considered.
+        top_assigned = set()
+        nested_assigned = set()
+        used = set()
+
+        def assigned_names(stmt):
+            names = set()
+            if isinstance(stmt, ast.Assign):
+                for t in stmt.targets:
+                    if isinstance(t, ast.Name):
+                        names.add(t.id)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                names.add(stmt.target.id)
+            return names
+
+        for stmt in body:
+            top_assigned |= assigned_names(stmt)
+        for stmt in body:
+            if isinstance(stmt, (ast.If, ast.For, ast.While, ast.Try)):
+                for sub in ast.walk(stmt):
+                    if sub is stmt:
+                        continue
+                    nested_assigned |= assigned_names(sub)
+        for stmt in body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    used.add(sub.id)
+        hoist = []
+        for name in nested_assigned:
+            if name in top_assigned:
+                continue
+            if name in self.declared_vars:
+                continue
+            if name not in used:
+                continue
+            hoist.append(name)
+        # Stable order: by first appearance among nested assignments.
+        for name in sorted(hoist):
+            self.line("var " + name + ";")
+            self.declared_vars.add(name)
 
     def _register_param_var_types(self, args):
         # Record each parameter's type kind in var_types so subscript,
@@ -1587,6 +1719,7 @@ class HaxeEmitter:
         # the rest of the body can use the parameter names as locals.
         if uses_options:
             self._emit_options_prelude(signature)
+        self._hoist_branch_locals(node.body)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
@@ -1950,6 +2083,16 @@ class HaxeEmitter:
         # format with no conversion just passes through.
         if isinstance(node.op, ast.Mod) and self._is_format_string(node.left):
             return self._emit_string_format(node.left, node.right)
+        # List concatenation: Python `a + b` on lists -> Haxe `a.concat(b)`
+        # (Haxe arrays have no `+` operator). Type-directed: only when both
+        # operands are known arrays.
+        if isinstance(node.op, ast.Add):
+            lk = self._static_kind(node.left)
+            rk = self._static_kind(node.right)
+            if lk is not None and lk[0] == "array" \
+                    and rk is not None and rk[0] == "array":
+                return (self.emit_expr(node.left) + ".concat(" +
+                        self.emit_expr(node.right) + ")")
         op = BINOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO binop: " + type(node.op).__name__ + " */"
@@ -2020,6 +2163,94 @@ class HaxeEmitter:
         escaped = s.replace("\\", "\\\\").replace('"', '\\"')
         return '"' + escaped + '"'
 
+    def _emit_builtin_module_call(self, module, node):
+        # Rewrite a non-portable stdlib member call to Haxe-native code.
+        # Returns the Haxe expression, or None if unrecognized (caller falls
+        # through to the generic path). Currently only `random`.
+        attr = node.func.attr
+        if module == "random":
+            if attr == "randint" and len(node.args) == 2:
+                # Python randint(a, b) is inclusive on both ends; Haxe
+                # Std.random(n) yields 0..n-1, so the span is (b - a + 1).
+                a = self.emit_expr(node.args[0])
+                b = self.emit_expr(node.args[1])
+                return ("(" + a + " + Std.random((" + b + ") - (" + a +
+                        ") + 1))")
+            if attr == "random" and not node.args:
+                return "Math.random()"
+            if attr == "choice" and len(node.args) == 1:
+                seq = self.emit_expr(node.args[0])
+                return (seq + "[Std.random(" + seq + ".length)]")
+            if attr == "uniform" and len(node.args) == 2:
+                a = self.emit_expr(node.args[0])
+                b = self.emit_expr(node.args[1])
+                return ("(" + a + " + Math.random() * ((" + b + ") - (" +
+                        a + ")))")
+        return None
+
+    def expr_JoinedStr(self, node):
+        # f-strings. Python `f"...{expr}..."` becomes Haxe string
+        # concatenation: literal Constant parts pass through as quoted
+        # literals; FormattedValue parts become Std.string(expr) (with
+        # optional fixed-precision rounding for a `:.Nf` spec). We use
+        # explicit concatenation rather than Haxe single-quote `$`/`${}`
+        # interpolation so arbitrary call/format-spec children compose
+        # uniformly and the existing quoting/escaping is reused. A pure
+        # literal collapses to one string; an all-empty f-string is `""`.
+        pieces = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                if part.value:
+                    pieces.append(self._haxe_str_literal(part.value))
+            else:
+                pieces.append(self.emit_expr(part))
+        if not pieces:
+            return self._haxe_str_literal("")
+        # Force a String context when the first piece is a Std.string()/literal
+        # already; if every piece is a single formatted value with no literal,
+        # Std.string keeps it a String.
+        if len(pieces) == 1 and isinstance(node.values[0], ast.Constant):
+            return pieces[0]
+        return " + ".join(pieces)
+
+    def expr_FormattedValue(self, node):
+        # One `{expr[:spec]}` hole inside an f-string. The conversion field
+        # (!r/!s/!a) and most of the format spec have no Haxe equivalent and
+        # are dropped, except a numeric fixed-precision `:.Nf` which we honor
+        # with an explicit round (Haxe has no printf). Everything renders via
+        # Std.string so non-string operands stringify.
+        spec = self._fstring_fixed_precision(node)
+        if spec is not None:
+            return self._fmt_fixed(node.value, spec)
+        return "Std.string(" + self.emit_expr(node.value) + ")"
+
+    def _fstring_fixed_precision(self, node):
+        # Return N for a `:.Nf` format spec on a FormattedValue, else None.
+        fmt = node.format_spec
+        if not isinstance(fmt, ast.JoinedStr) or len(fmt.values) != 1:
+            return None
+        part = fmt.values[0]
+        if not (isinstance(part, ast.Constant) and isinstance(part.value, str)):
+            return None
+        s = part.value
+        if len(s) >= 3 and s[0] == "." and s[-1] == "f" and s[1:-1].isdigit():
+            return int(s[1:-1])
+        return None
+
+    def _fmt_fixed(self, value_node, digits):
+        # Render `value` to `digits` decimal places as a String. Haxe lacks a
+        # printf/toFixed, so we round to the scale and stringify. This is an
+        # approximation (no trailing-zero padding); it is only reached on the
+        # f-string fallback path in systems.apply_shift, where the value is a
+        # drag delta that is later re-parsed. Documented as a known gap; exact
+        # formatting should use a disciplined Python-side formatter.
+        expr = self.emit_expr(value_node)
+        if digits == 0:
+            return "Std.string(Math.round(" + expr + "))"
+        scale = 10 ** digits
+        return ("Std.string(Math.round((" + expr + ") * " + str(scale) +
+                ") / " + str(scale) + ")")
+
     def _static_kind(self, node):
         # Best-effort kind of an expression node (str / array / map),
         # used for type-directed truthiness and membership. Returns a kind
@@ -2033,7 +2264,19 @@ class HaxeEmitter:
             return ("array",)
         if isinstance(node, (ast.ListComp,)):
             return ("array",)
-        if isinstance(node, (ast.Dict, ast.DictComp, ast.SetComp)):
+        if isinstance(node, ast.DictComp):
+            # Record the value-element kind when it's a set (`{k: set() ...}`),
+            # so a later `m[k].add(x)` knows m[k] is a set. Stored as
+            # ("map", value_kind).
+            vk = self._set_valued_comp_kind(node.value)
+            return ("map", vk) if vk is not None else ("map",)
+        if isinstance(node, ast.Dict):
+            if node.values:
+                vk = self._set_valued_comp_kind(node.values[0])
+                if vk is not None:
+                    return ("map", vk)
+            return ("map",)
+        if isinstance(node, ast.SetComp):
             return ("map",)
         # sorted(...) yields a new array.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
@@ -2049,6 +2292,10 @@ class HaxeEmitter:
             base = self.var_types.get(node.value.id)
             if base is not None and base[0] == "str":
                 return ("str",)
+            # Indexing a map whose value-kind we tracked (e.g. a map of sets)
+            # yields that element kind, so `m[k].add(x)` picks the set form.
+            if base is not None and base[0] == "map" and len(base) > 1:
+                return base[1]
         # Attribute access: `recv.attr`. Resolve the receiver's class and
         # look up the field's declared type. Covers both `self.f` and a
         # tracked local of known class type, including base-typed receivers
@@ -2065,6 +2312,17 @@ class HaxeEmitter:
                         cls_name = info[1]
             if cls_name is not None:
                 return self._field_kind_of_class(cls_name, node.attr)
+        return None
+
+    def _set_valued_comp_kind(self, value_node):
+        # Return ("set",) if the dict/map value expression constructs a set
+        # (`set()` or a set comprehension/literal), else None. Used to track
+        # map-of-set value kinds for type-directed `m[k].add(...)`.
+        if isinstance(value_node, ast.Call) and isinstance(value_node.func, ast.Name) \
+                and value_node.func.id == "set":
+            return ("set",)
+        if isinstance(value_node, ast.SetComp) or isinstance(value_node, ast.Set):
+            return ("set",)
         return None
 
     def _emit_test(self, node):
@@ -2181,10 +2439,71 @@ class HaxeEmitter:
                 and node.func.attr == "__init__":
             return self._format_super_init_call(node)
 
+        # Non-portable stdlib module calls (`random.randint`, ...) rewritten
+        # inline to Haxe-native equivalents. See BUILTIN_MODULES.
+        if isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id in self.builtin_module_aliases:
+            rewritten = self._emit_builtin_module_call(
+                self.builtin_module_aliases[node.func.value.id], node)
+            if rewritten is not None:
+                return rewritten
+
+        # hex(n) -> ("0x" + StringTools.hex(n)): Python's hex() prefixes
+        # "0x"; we mirror it so a trailing `[2:]` strips the prefix and the
+        # value matches. Haxe StringTools.hex yields uppercase digits (case
+        # is irrelevant for the color-string use in systems.py).
+        if isinstance(node.func, ast.Name) and node.func.id == "hex" \
+                and len(node.args) == 1:
+            return '("0x" + StringTools.hex(' + self.emit_expr(node.args[0]) + "))"
+
+        # str.zfill(w) -> StringTools.lpad(s, "0", w): left-pad with zeros.
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "zfill" \
+                and len(node.args) == 1:
+            receiver = self.emit_expr(node.func.value)
+            width = self.emit_expr(node.args[0])
+            return 'StringTools.lpad(' + receiver + ', "0", ' + width + ")"
+
         # Special case: len(x) -> x.length. Python builtin -> Haxe property.
         if isinstance(node.func, ast.Name) and node.func.id == "len" \
                 and len(node.args) == 1:
             return self.emit_expr(node.args[0]) + ".length"
+
+        # abs(x) -> Math.abs(x). Python builtin -> Haxe Math.
+        if isinstance(node.func, ast.Name) and node.func.id == "abs" \
+                and len(node.args) == 1:
+            return "Math.abs(" + self.emit_expr(node.args[0]) + ")"
+
+        # list(iterable) -> a materialized Array. Python's list() turns an
+        # iterator (e.g. a Map's keys()) into a concrete list; Haxe has no
+        # `list` type-call, so we comprehend the iterable into an Array.
+        # list() with no args -> a fresh empty Array.
+        if isinstance(node.func, ast.Name) and node.func.id == "list":
+            if not node.args:
+                return "[]"
+            if len(node.args) == 1:
+                tmp = self._fresh_tmp()
+                return ("[for (" + tmp + " in " +
+                        self._emit_iterable(node.args[0]) + ") " + tmp + "]")
+
+        # Module-qualified constructor: `mod.ClassName(args)` where `mod` is
+        # an imported module and `ClassName` is a known (scanned) class.
+        # Emit `new Mod.ClassName(args)` — the cross-module `new` form Haxe
+        # needs; otherwise it reads as calling the class as a function.
+        if isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id in self.imported_modules \
+                and node.func.attr in self.classes \
+                and node.func.attr[:1].isupper():
+            cls = self.classes[node.func.attr]
+            qualified = (self.imported_modules[node.func.value.id] + "." +
+                         node.func.attr)
+            init = cls["method_signatures"].get("__init__")
+            if init is not None:
+                resolved = self._resolve_to_positional(init, node)
+                return "new " + qualified + "(" + ", ".join(resolved) + ")"
+            args = [self.emit_expr(a) for a in node.args]
+            return "new " + qualified + "(" + ", ".join(args) + ")"
 
         # Special case: str(x) -> Std.string(x). Python builtin -> Haxe
         # standard library function. Only the single-argument form maps
@@ -2425,13 +2744,12 @@ class HaxeEmitter:
         # variable of a known base class that does NOT declare this attr but
         # a subclass does, route the access through an untyped cast so it
         # resolves at runtime — matching the Python duck-typed access.
-        if isinstance(node.value, ast.Name):
-            var_info = self.var_types.get(node.value.id)
-            if var_info is not None and var_info[0] == "class":
-                cls_name = var_info[1]
-                if not self._class_has_member(cls_name, attr) \
-                        and self._subclass_has_member(cls_name, attr):
-                    return "(cast " + receiver + ")." + attr
+        recv_info = self._static_kind(node.value)
+        if recv_info is not None and recv_info[0] == "class":
+            cls_name = recv_info[1]
+            if not self._class_has_member(cls_name, attr) \
+                    and self._subclass_has_member(cls_name, attr):
+                return "(cast " + receiver + ")." + attr
         return receiver + "." + attr
 
     def expr_List(self, node):
@@ -2649,6 +2967,9 @@ def convert(source, filename="<input>"):
     base = os.path.basename(filename)
     if base and base not in ("<input>", "<string>") and base.endswith(".py"):
         emitter.module_class_name = emitter._module_to_class_name(base[:-3])
+        # Remember the source directory so emit_module can scan sibling
+        # modules for cross-module type info (Milestone 8 type-loading).
+        emitter._source_dir = os.path.dirname(os.path.abspath(filename))
     emitter._comments = _extract_comments(source)
     emitter.emit_module(tree)
     emitter._drain_remaining_comments()
