@@ -58,7 +58,7 @@ Early development. Milestone 1 of the emitter is verified working on a small exa
 | Emitter — Milestone 5: signature-aware kwargs resolution | planned |
 | Emitter — Milestone 6: try/except, raise | planned |
 | Emitter — Milestone 7: extended type system (Optional, List, Dict) | planned |
-| Emitter — Milestone 8: imports and module organization | planned |
+| Emitter — Milestone 8: imports and module organization | complete |
 | Polish — comment preservation, formatting, error reporting | planned |
 
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full milestone breakdown.

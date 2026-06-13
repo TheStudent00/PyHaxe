@@ -1,4 +1,4 @@
-class Main {
+class TypesExample {
     public static function first_or_none(items:Array<Int>):Null<Int> {
         if (items.length == 0) {
             return null;

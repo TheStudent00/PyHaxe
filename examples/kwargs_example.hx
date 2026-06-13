@@ -46,7 +46,7 @@ class DiscountedItem extends Item {
     }
 }
 
-class Main {
+class KwargsExample {
     public static function add(a:Int, b:Int):Int {
         return a + b;
     }

@@ -47,7 +47,7 @@ class Repository {
     }
 }
 
-class Main {
+class ExceptionsExample {
     public static function parse_positive_int(value:Int):Int {
         if (value <= 0) {
             throw new ValidationError("not a positive integer");
