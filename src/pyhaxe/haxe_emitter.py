@@ -124,8 +124,25 @@ PYTHON_TO_HAXE_TYPES = {
     # element type given, fall back to Dynamic element/value types.
     "list": "Array<Dynamic>",
     "dict": "Map<String, Dynamic>",
-    "set": "Map<Dynamic, Bool>",
+    # Bare `set` (no element type): Haxe Maps cannot key on Dynamic, so default
+    # to String keys — matching the String-keyed bare `dict` default and the
+    # disciplined code's string-id sets. A typed `Set[T]` keeps T.
+    "set": "Map<String, Bool>",
+    # Bare `tuple` annotation (no arity) — heterogeneous, so Dynamic. Typed
+    # `Tuple[A, B]` annotations still resolve to a concrete TupleN elsewhere.
+    "tuple": "Dynamic",
 }
+
+# Haxe top-level builtin functions that a Python identifier may collide with.
+# A local var or nested function named e.g. `trace` would otherwise bind to
+# Haxe's builtin (wrong type / `Void`), so such identifiers are renamed with a
+# trailing underscore consistently at definition and use. Only genuine
+# call-resolvable builtins are listed (not contextual keywords like `default`,
+# which Haxe accepts as plain identifiers outside their construct).
+HAXE_RESERVED_IDENTIFIERS = {
+    "trace",
+}
+
 
 GENERIC_TYPES = {
     "List": "Array",
@@ -337,6 +354,31 @@ class HaxeEmitter:
         # are buffered here and flushed at the very top of the output
         # (before generated TupleN classes), not emitted inline.
         self._haxe_imports = []
+        # Local names introduced by dropped backend imports (e.g. `Widget`,
+        # `RelativeLayout` from `from kivy.uix... import ...`). If any of these
+        # leak into emitted @haxe_extern signatures, a bare `extern class Name
+        # {}` stub is emitted so the module type-checks standalone (the real
+        # type is supplied by the per-target backend).
+        self._backend_type_names = set()
+        # class name -> set of raw (pre-strip) class-variable names emitted as
+        # Haxe statics. `self.NAME` reads of these resolve to `ClassName.NAME`.
+        self.class_statics = {}
+        # (class name, raw static name) -> inferred kind tuple, for statics
+        # whose kind comes from their value (no annotation), e.g. an
+        # `Array<Tuple2<...>>` constant.
+        self.class_static_kinds = {}
+        # When True, generated TupleN helper classes are NOT inlined into each
+        # module; instead an `import Tuples;` is emitted and the classes live in
+        # a single shared `Tuples.hx` (see emit_tuples_module). This avoids
+        # "Type Tuple2 is redefined" when several modules in one build dir each
+        # use tuples. Default False preserves single-module/standalone output.
+        self.shared_tuples = False
+        # When a module's holder-class name collides with one of its own
+        # classes, the module constants/free functions are folded into that
+        # class as statics (set in emit_module).
+        self._merge_into_class = None
+        self._merge_consts = []
+        self._merge_functions = []
 
     def line(self, text):
         self.lines.append("    " * self.indent_level + text)
@@ -563,6 +605,19 @@ class HaxeEmitter:
                 self.var_types[name] = kind
         self._module_consts = module_consts
 
+        # If the module's holder-class name (used for free functions /
+        # module constants) collides with a class defined IN the module
+        # (e.g. handles.py defines `class Handles` and the module is
+        # `Handles`), Haxe would see two `Handles` types in one module. Fold
+        # the module constants and free functions into that existing class as
+        # statics instead of emitting a separate holder class.
+        self._merge_into_class = None
+        if self.module_class_name in self.classes \
+                and (free_functions or module_consts):
+            self._merge_into_class = self.module_class_name
+            self._merge_consts = module_consts
+            self._merge_functions = free_functions
+
         # Emit declarations into a separate list so we can prepend any
         # auto-generated TupleN classes once we know which arities were
         # actually used during emission.
@@ -576,13 +631,26 @@ class HaxeEmitter:
         # cross-module imports collected during the decls pass are flushed
         # first (Milestone 8), then the generated TupleN classes, then the
         # rest of the declarations.
+        # In shared-tuples mode, pull the TupleN classes out of this module and
+        # depend on the shared `Tuples` module instead (import flushed below).
+        # A wildcard import brings every TupleN sub-type into scope by short
+        # name so `new Tuple2(...)` / `Tuple2<...>` resolve unchanged.
+        self._needs_tuples_import = self.shared_tuples and bool(self.tuple_arities)
         self._emit_haxe_imports()
-        self._emit_tuple_classes()
+        self._emit_backend_type_stubs(body_lines)
+        if not self.shared_tuples:
+            self._emit_tuple_classes()
         self.lines.extend(body_lines)
 
         # Generate Main class if it has any content (free functions,
-        # module-level constants, or main-body statements).
-        if free_functions or main_body or module_consts:
+        # module-level constants, or main-body statements). When the consts /
+        # free functions were merged into a same-named class above, only a
+        # remaining main-body (rare) still needs a holder — but that too would
+        # collide, so it is dropped (disciplined library modules have no
+        # __main__ body).
+        if self._merge_into_class is not None:
+            pass
+        elif free_functions or main_body or module_consts:
             self._emit_main_class(free_functions, main_body, module_consts)
 
     def _partition_module_body(self, body):
@@ -594,6 +662,16 @@ class HaxeEmitter:
             if self._is_module_docstring(stmt):
                 # Module docstrings are dropped entirely (same as Python
                 # would: they're available as __doc__ but don't execute).
+                continue
+            if self._is_type_checking_guard(stmt):
+                # `if TYPE_CHECKING:` holds imports used only for forward type
+                # references (e.g. cyclic imports). The type IS referenced in
+                # emitted signatures, so its import must still be emitted —
+                # route the guard's imports into decls. Non-import statements
+                # in the guard are typing-only and dropped.
+                for inner in stmt.body:
+                    if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                        decls.append(inner)
                 continue
             if isinstance(stmt, ast.FunctionDef):
                 # Free functions need a home in Haxe (no module-scope
@@ -615,7 +693,34 @@ class HaxeEmitter:
                 # Other free statements at module scope (rare in
                 # disciplined code, but possible) also go into main().
                 main_body.append(stmt)
+        # Drop backend-glue free functions: a module-level def that is
+        # referenced ONLY inside @haxe_extern class bodies is helper code for
+        # the dropped backend (e.g. kit.py's `_parse_rgba`, called only by the
+        # extern UI/widget bodies). It is not part of the disciplined surface,
+        # so hoisting it into the module class would emit non-portable Haxe for
+        # code that no portable caller reaches. Functions used anywhere outside
+        # an extern body are kept.
+        if free_functions:
+            free_functions = self._drop_extern_only_functions(free_functions, body)
         return decls, free_functions, main_body, module_consts
+
+    def _drop_extern_only_functions(self, free_functions, body):
+        fn_names = {f.name for f in free_functions}
+        # A free function is dropped only if it is referenced INSIDE an
+        # @haxe_extern class body AND nowhere outside one. Functions never
+        # referenced internally at all are kept — they are the module's public
+        # API (called cross-module), e.g. ConstraintEval.evaluate. Only the
+        # pure backend-glue helpers (used solely by dropped extern bodies, like
+        # kit.py's `_parse_rgba`) are removed.
+        used_in_extern = set()
+        used_outside = set()
+        for stmt in body:
+            is_extern = isinstance(stmt, ast.ClassDef) and self._is_haxe_extern(stmt)
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name) and sub.id in fn_names:
+                    (used_in_extern if is_extern else used_outside).add(sub.id)
+        drop = (used_in_extern - used_outside)
+        return [f for f in free_functions if f.name not in drop]
 
     def _module_const_name(self, stmt):
         if isinstance(stmt, ast.AnnAssign):
@@ -641,6 +746,13 @@ class HaxeEmitter:
         # stmt_Import / stmt_ImportFrom decide what to do with them.
         return isinstance(stmt, (ast.ClassDef, ast.FunctionDef,
                                  ast.Import, ast.ImportFrom))
+
+    def _is_type_checking_guard(self, stmt):
+        # Detect `if TYPE_CHECKING:` (the typing.TYPE_CHECKING constant, False
+        # at runtime). Its body holds type-only imports / forward refs.
+        if not isinstance(stmt, ast.If):
+            return False
+        return isinstance(stmt.test, ast.Name) and stmt.test.id == "TYPE_CHECKING"
 
     def _is_main_guard(self, stmt):
         # Detect `if __name__ == "__main__":` exactly. Anything else
@@ -774,11 +886,46 @@ class HaxeEmitter:
         # file (Haxe requires imports before any declaration). A module
         # import brings the module's main type and its sibling types into
         # scope by their short names.
-        if not self._haxe_imports:
+        needs_tuples = getattr(self, "_needs_tuples_import", False)
+        if not self._haxe_imports and not needs_tuples:
             return
+        if needs_tuples:
+            # Import each used TupleN type from the shared Tuples module by its
+            # full path so it resolves by short name (Haxe needs the explicit
+            # type path; a bare module import wouldn't bring multi-type modules
+            # into scope).
+            for arity in sorted(self.tuple_arities):
+                self.line("import Tuples.Tuple" + str(arity) + ";")
         for module_class in self._haxe_imports:
             self.line("import " + module_class + ";")
         self.line("")
+
+    def _emit_backend_type_stubs(self, body_lines):
+        # Emit a bare `extern class Name {}` for each dropped-backend local
+        # name that leaked into an emitted signature (field/param/return type).
+        # These are platform/backend types (e.g. Kivy's Widget/RelativeLayout)
+        # exposed by @haxe_extern signatures; the real definition lives in the
+        # per-target backend. A bare extern lets the module type-check
+        # standalone. Names defined as classes in this module are skipped.
+        if not self._backend_type_names:
+            return
+        import re
+        defined = set()
+        for ln in body_lines:
+            m = re.match(r"\s*(?:extern )?class (\w+)", ln)
+            if m:
+                defined.add(m.group(1))
+        text = "\n".join(body_lines)
+        stubs = []
+        for name in sorted(self._backend_type_names):
+            if name in defined:
+                continue
+            if re.search(r"\b" + re.escape(name) + r"\b", text):
+                stubs.append(name)
+        for name in stubs:
+            self.line("extern class " + name + " {}")
+        if stubs:
+            self.line("")
 
     def _emit_tuple_classes(self):
         # One generated TupleN class per arity used. Generic over its
@@ -786,6 +933,15 @@ class HaxeEmitter:
         # See development notes for the design rationale.
         for arity in sorted(self.tuple_arities):
             self._emit_one_tuple_class(arity)
+
+    def emit_tuples_module(self, arities):
+        # Emit a standalone `Tuples.hx` defining every TupleN class for the
+        # given arities — the shared home referenced by `import Tuples;` when
+        # shared_tuples is on. Returns the source text.
+        self.lines = []
+        self.tuple_arities = set(arities)
+        self._emit_tuple_classes()
+        return self.output()
 
     def _emit_one_tuple_class(self, arity):
         type_params = ", ".join("T" + str(i) for i in range(arity))
@@ -900,6 +1056,13 @@ class HaxeEmitter:
                 if isinstance(item, ast.FunctionDef):
                     methods.add(item.name)
                     method_signatures[item.name] = self._build_signature(item)
+                    # `@property` getters expose a field-like attribute; record
+                    # the getter's return annotation as the field's type so
+                    # `obj.prop` accesses are type-directed (e.g.
+                    # `state.selected_node -> Optional[UINode]`).
+                    if self._has_decorator(item, "property") \
+                            and item.returns is not None:
+                        field_annotations.setdefault(item.name, item.returns)
                     # Fields are also bound as `self.x = ...` in __init__;
                     # their declared types come from the matching parameter
                     # annotation when the assignment is `self.x = x`.
@@ -920,11 +1083,35 @@ class HaxeEmitter:
                                             field_annotations.setdefault(
                                                 tgt.attr,
                                                 param_anns[sub.value.id])
+                            elif isinstance(sub, ast.AnnAssign) \
+                                    and isinstance(sub.target, ast.Attribute) \
+                                    and isinstance(sub.target.value, ast.Name) \
+                                    and sub.target.value.id == "self":
+                                # `self.x: T = value` annotates an instance
+                                # field with its declared type.
+                                fields.add(sub.target.attr)
+                                if sub.annotation is not None:
+                                    field_annotations.setdefault(
+                                        sub.target.attr, sub.annotation)
                 elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
                     fields.add(item.target.id)
                     declared_fields.add(item.target.id)
                     if item.annotation is not None:
                         field_annotations[item.target.id] = item.annotation
+                    # `NAME: T = value` at class scope is a class variable
+                    # (static), distinct from a bare instance-field declaration.
+                    if item.value is not None:
+                        self.class_statics.setdefault(stmt.name, set()).add(item.target.id)
+                elif isinstance(item, ast.Assign):
+                    # `NAME = value` at class scope -> Python class variable
+                    # -> Haxe static. Record an inferred kind so member access
+                    # / iteration over the static is type-directed.
+                    for tgt in item.targets:
+                        if isinstance(tgt, ast.Name):
+                            self.class_statics.setdefault(stmt.name, set()).add(tgt.id)
+                            k = self._infer_value_kind(item.value)
+                            if k is not None:
+                                self.class_static_kinds[(stmt.name, tgt.id)] = k
             self.classes[stmt.name] = {
                 "bases": bases,
                 "methods": methods,
@@ -1138,6 +1325,9 @@ class HaxeEmitter:
     def _field_kind_of_class(self, class_name, attr):
         # Type-kind tuple of `attr` on class_name (str/array/map/...), or
         # None. Drives type-directed truthiness/membership on attributes.
+        k = self.class_static_kinds.get((class_name, attr))
+        if k is not None:
+            return k
         ann = self._field_annotation_of_class(class_name, attr)
         return self._type_kind_of(ann)
 
@@ -1148,7 +1338,18 @@ class HaxeEmitter:
     # is consumed during emission, not imported in Haxe). The discipline
     # module provides @haxe_extern, also tooling-only. __future__ is
     # Python-version compatibility, not relevant.
-    SILENT_IMPORT_MODULES = {"typing", "__future__", "discipline", "pyhaxe.discipline"}
+    SILENT_IMPORT_MODULES = {"typing", "__future__", "discipline",
+                             "pyhaxe.discipline", "haxe_extern"}
+
+    # Top-level packages that are pure backend/platform glue: they exist only
+    # to implement `@haxe_extern` class bodies (e.g. GUI4GUI's Kivy backend in
+    # kit.py), which the emitter drops anyway. Importing them as Haxe modules
+    # would emit dangling `import App;`/`import Boxlayout;` for types that have
+    # no portable Haxe equivalent and are never referenced outside the dropped
+    # extern bodies. We drop these imports entirely. Like BUILTIN_MODULES this
+    # is a pragmatic, hard-coded list; the principled replacement is per-target
+    # hand-written externs for the backend types the extern signatures expose.
+    BACKEND_IMPORT_PACKAGES = {"kivy"}
 
     # Non-portable Python stdlib modules with no 1:1 Haxe class. Their
     # imports are dropped (no `import Random;`) and their member calls are
@@ -1158,11 +1359,27 @@ class HaxeEmitter:
     # (Milestone 4) — a disciplined `random.py` wrapper marked @haxe_extern
     # whose backend is hand-written Haxe. The same wrapper mechanism is how
     # GUI4GUI's own kit @haxe_extern backend plugs in.
-    BUILTIN_MODULES = {"random"}
+    BUILTIN_MODULES = {"random", "time"}
+
+    def _is_backend_import(self, module):
+        # True if `module` belongs to a backend/platform package whose imports
+        # exist only to implement dropped @haxe_extern bodies (e.g. `kivy.app`,
+        # `kivy.uix.button`). Matches the package root and any submodule.
+        if module is None:
+            return False
+        root = module.split(".", 1)[0]
+        return root in self.BACKEND_IMPORT_PACKAGES
 
     def stmt_ImportFrom(self, node):
         # Drop typing/tooling imports silently.
         if node.module in self.SILENT_IMPORT_MODULES:
+            return
+        # Drop backend-only (extern-implementing) imports silently, but
+        # remember the local names so any that leak into extern signatures
+        # get an `extern class` stub at flush time.
+        if self._is_backend_import(node.module):
+            for alias in node.names:
+                self._backend_type_names.add(alias.asname or alias.name)
             return
         # Cross-module `from x import y [as z]` (Milestone 8). The Python
         # module `x` maps to a Haxe class `X` whose top-level functions /
@@ -1202,6 +1419,9 @@ class HaxeEmitter:
         emitted = []
         for alias in node.names:
             if alias.name in self.SILENT_IMPORT_MODULES:
+                continue
+            if self._is_backend_import(alias.name):
+                self._backend_type_names.add(alias.asname or alias.name)
                 continue
             if alias.name in self.BUILTIN_MODULES:
                 # Non-portable stdlib: no Haxe import; record the local name
@@ -1269,7 +1489,7 @@ class HaxeEmitter:
 
         params = self._format_params(node.args)
         ret = self.emit_type(node.returns)
-        self.line("function " + node.name + "(" + params + "):" + ret + " {")
+        self.line("function " + self._safe_ident(node.name) + "(" + params + "):" + ret + " {")
         self.indent_level += 1
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
@@ -1382,8 +1602,22 @@ class HaxeEmitter:
         if isinstance(type_node, ast.Subscript):
             base = type_node.value.id if isinstance(type_node.value, ast.Name) else None
             if base in ("List", "list"):
-                return ("array",)
+                # Capture the element kind so iterating types the loop var.
+                slice_node = type_node.slice
+                if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                    slice_node = slice_node.value
+                ek = self._type_kind_of(slice_node)
+                return ("array", ek) if ek is not None else ("array",)
             if base in ("Dict", "dict"):
+                # Capture the value-type kind (Dict[K, V] -> ("map", kind(V)))
+                # so `m.get(k)` / iteration know the element kind.
+                slice_node = type_node.slice
+                if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                    slice_node = slice_node.value
+                if isinstance(slice_node, ast.Tuple) and len(slice_node.elts) == 2:
+                    vk = self._type_kind_of(slice_node.elts[1])
+                    if vk is not None:
+                        return ("map", vk)
                 return ("map",)
             # A set is modeled as a Map<T, Bool>; track it as a map but
             # remember it's a set so `.add` and membership pick set forms.
@@ -1413,8 +1647,21 @@ class HaxeEmitter:
         # String literal -> str.
         if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
             return ("str",)
-        # List literal -> array.
+        # List literal -> array. Record the element kind when the elements are
+        # uniform tuple literals, so iterating the array types the loop var as
+        # a tuple (`pair[0]` -> `pair._0`).
         if isinstance(value_node, ast.List):
+            if value_node.elts and all(isinstance(e, ast.Tuple) for e in value_node.elts):
+                arities = {len(e.elts) for e in value_node.elts}
+                if len(arities) == 1:
+                    return ("array", ("tuple", arities.pop()))
+            # Uniform element kind (e.g. all str-typed fields) -> typed array,
+            # so iterating it types the loop var.
+            if value_node.elts:
+                elem_kinds = [self._static_kind(e) for e in value_node.elts]
+                if elem_kinds[0] is not None \
+                        and all(k == elem_kinds[0] for k in elem_kinds):
+                    return ("array", elem_kinds[0])
             return ("array",)
         # Dict literal -> map.
         if isinstance(value_node, ast.Dict):
@@ -1429,6 +1676,15 @@ class HaxeEmitter:
                 # A slice of a str is still a str; an index of a str is a
                 # single-char str (Haxe charAt returns String).
                 return ("str",)
+        # `m.get(k)` on a map whose value-kind we track -> that element kind
+        # (e.g. `n = state.nodes.get(id)` makes n a UINode, so `not n` becomes
+        # a null check). Plain `m[k]` (Subscript) handled above.
+        if isinstance(value_node, ast.Call) \
+                and isinstance(value_node.func, ast.Attribute) \
+                and value_node.func.attr == "get" and len(value_node.args) >= 1:
+            recv_kind = self._static_kind(value_node.func.value)
+            if recv_kind is not None and recv_kind[0] == "map" and len(recv_kind) > 1:
+                return recv_kind[1]
         # Call to a known free function -> kind of its declared return type
         # (e.g. `tokens = tokenize(text)` where tokenize -> List[Token]).
         if isinstance(value_node, ast.Call) and isinstance(value_node.func, ast.Name):
@@ -1598,6 +1854,17 @@ class HaxeEmitter:
                     and isinstance(stmt.value.value, str):
                 continue
             self.emit_stmt(stmt)
+
+        # Fold in module-level constants and free functions when this class's
+        # name collides with the module holder name (see emit_module).
+        if self._merge_into_class == node.name:
+            if self._merge_consts:
+                self.line("")
+                for stmt in self._merge_consts:
+                    self._emit_module_constant(stmt)
+            for func in self._merge_functions:
+                self.line("")
+                self._emit_static_function_in_class(func)
 
         self.in_class = prev_in_class
         self.current_class_name = prev_class_name
@@ -1822,6 +2089,15 @@ class HaxeEmitter:
 
     def stmt_AnnAssign(self, node):
         target = self.emit_expr(node.target)
+        # An annotated assignment to an attribute (`self.x: T = value`) inside a
+        # method body is just a field write — the field is already declared at
+        # class scope (auto-declared by the scanner). Emit a plain assignment,
+        # never `var this.x`.
+        if isinstance(node.target, ast.Attribute):
+            if node.value is None:
+                return
+            self.line(target + " = " + self.emit_expr(node.value) + ";")
+            return
         type_str = self.emit_type(node.annotation)
         # Track the target's type kind (tuple / str / array / map) so
         # expr_Subscript, slice handling, and membership tests can branch.
@@ -1848,7 +2124,10 @@ class HaxeEmitter:
                     visibility = "public"
             else:
                 visibility = "public"
-            prefix = visibility + " var "
+            # `NAME: T = value` at class scope is a class variable (static).
+            # A bare `NAME: T` (no value) is an instance-field declaration.
+            is_static = node.value is not None and isinstance(node.target, ast.Name)
+            prefix = visibility + (" static var " if is_static else " var ")
         else:
             prefix = "var "
         if node.value is None:
@@ -1879,10 +2158,52 @@ class HaxeEmitter:
             if not self.in_class and name not in self.declared_vars:
                 is_new_local = True
                 self.declared_vars.add(name)
+        # A bare-Name assignment at class-body scope (not inside a method) is
+        # a Python class variable — shared, so a Haxe `static var`. Visibility
+        # follows the leading-underscore convention; the underscore is stripped
+        # and the static is recorded so `self.NAME` reads resolve to
+        # `ClassName.NAME` (Haxe forbids instance access to statics).
+        if self.in_class and isinstance(target_node, ast.Name):
+            raw = target_node.id
+            if self._is_private_name(raw):
+                out_name = self._strip_private_underscores(raw)
+                vis = "private"
+            else:
+                out_name = raw
+                vis = "public"
+            self.class_statics.setdefault(self.current_class_name, set()).add(raw)
+            value = self.emit_expr(node.value)
+            self.line(vis + " static var " + out_name + " = " + value + ";")
+            return
         target = self.emit_expr(target_node)
         value = self.emit_expr(node.value)
+        # Haxe `Math.max`/`Math.min` etc. always return Float; Python `max`/
+        # `min` over ints stay int. When the assignment target is declared
+        # `int`, wrap a Float-producing RHS in `Std.int(...)` so it fits.
+        if self._is_int_target(target_node) and self._yields_float(node.value):
+            value = "Std.int(" + value + ")"
         prefix = "var " if is_new_local else ""
         self.line(prefix + target + " = " + value + ";")
+
+    def _is_int_target(self, target_node):
+        # True if the assignment target is a known `int`-typed attribute/var.
+        if isinstance(target_node, ast.Attribute):
+            recv = self._static_kind(target_node.value)
+            if recv is not None and recv[0] == "class":
+                ann = self._field_annotation_of_class(recv[1], target_node.attr)
+                return isinstance(ann, ast.Name) and ann.id == "int"
+        return False
+
+    def _yields_float(self, value_node):
+        # True if the RHS produces a Haxe Float that an int target would
+        # reject — Math.max/min/abs/round/random calls, or an expression
+        # containing one. Conservative: covers the constructs the emitter maps
+        # to Math.* (Python max/min/abs over numbers).
+        for sub in ast.walk(value_node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) \
+                    and sub.func.id in ("max", "min"):
+                return True
+        return False
 
     def stmt_AugAssign(self, node):
         target = self.emit_expr(node.target)
@@ -1892,6 +2213,29 @@ class HaxeEmitter:
             self.line("// TODO augassign: " + type(node.op).__name__)
             return
         self.line(target + " " + op + " " + value + ";")
+
+    def stmt_Delete(self, node):
+        # `del m[k]`  -> `m.remove(k);`   (Map.remove / StringMap.remove)
+        # `del list[i]` -> `list.splice(i, 1);`  (Array element removal)
+        # Type-directed: pick remove vs splice from the receiver's kind.
+        # Disciplined Python deletes one subscript target at a time.
+        for target in node.targets:
+            slice_node = None
+            if isinstance(target, ast.Subscript):
+                slice_node = target.slice
+                if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):
+                    slice_node = slice_node.value
+            if slice_node is None or isinstance(slice_node, ast.Slice):
+                self.line("// TODO stmt: Delete " + type(target).__name__)
+                continue
+            receiver = self.emit_expr(target.value)
+            index = self.emit_expr(slice_node)
+            kind = self._static_kind(target.value)
+            if kind is not None and kind[0] == "array":
+                self.line(receiver + ".splice(" + index + ", 1);")
+            else:
+                # Maps (and the common case) use remove(key).
+                self.line(receiver + ".remove(" + index + ");")
 
     def _emit_block_body(self, body, extra_declared=None):
         # Emit a nested block's statements under their own declared-var
@@ -1943,8 +2287,20 @@ class HaxeEmitter:
         self.line("}")
 
     def stmt_For(self, node):
-        # Disciplined Python: target is always a single Name (no tuple
-        # unpacking), iter is either a `range(...)` call or a collection.
+        # Disciplined Python: iter is a `range(...)` call or a collection; the
+        # target is a Name, except `for k, v in m.items()` which unpacks a
+        # (key, value) pair -> Haxe key-value iteration `for (k => v in m)`.
+        kv = self._items_kv_target(node.target, node.iter)
+        if kv is not None:
+            self.line("for (" + kv + ") {")
+            self.indent_level += 1
+            keys = set()
+            if isinstance(node.target, ast.Tuple):
+                keys = {e.id for e in node.target.elts if isinstance(e, ast.Name)}
+            self._emit_block_body(node.body, extra_declared=keys)
+            self.indent_level -= 1
+            self.line("}")
+            return
         target = self.emit_expr(node.target)
         iter_expr = self._format_for_iter(node.iter)
         self.line("for (" + target + " in " + iter_expr + ") {")
@@ -1952,11 +2308,43 @@ class HaxeEmitter:
         # The loop variable is declared by the `for` header in Haxe, so
         # reassignments to it inside the body must not re-emit `var`.
         extra = set()
+        saved_kind = None
+        had_kind = False
         if isinstance(node.target, ast.Name):
             extra.add(node.target.id)
+            # If the iterable is an array with a known element kind, type the
+            # loop var so element ops (e.g. tuple `pair[0]` -> `pair._0`)
+            # dispatch correctly inside the body.
+            iter_kind = self._static_kind(node.iter)
+            elem_kind = iter_kind[1] if iter_kind is not None \
+                and iter_kind[0] == "array" and len(iter_kind) > 1 else None
+            had_kind = node.target.id in self.var_types
+            saved_kind = self.var_types.get(node.target.id)
+            if elem_kind is not None:
+                self.var_types[node.target.id] = elem_kind
         self._emit_block_body(node.body, extra_declared=extra)
+        if isinstance(node.target, ast.Name):
+            if had_kind:
+                self.var_types[node.target.id] = saved_kind
+            else:
+                self.var_types.pop(node.target.id, None)
         self.indent_level -= 1
         self.line("}")
+
+    def _items_kv_target(self, target_node, iter_node):
+        # If this is `for k, v in MAP.items()`, return the Haxe key-value
+        # iteration header `k => v in MAP`. Otherwise None. Haxe Maps support
+        # `for (key => value in map)` directly — no `.items()` method exists.
+        if not (isinstance(target_node, ast.Tuple) and len(target_node.elts) == 2):
+            return None
+        if not (isinstance(iter_node, ast.Call)
+                and isinstance(iter_node.func, ast.Attribute)
+                and iter_node.func.attr == "items" and not iter_node.args):
+            return None
+        k = self.emit_expr(target_node.elts[0])
+        v = self.emit_expr(target_node.elts[1])
+        receiver = self.emit_expr(iter_node.func.value)
+        return k + " => " + v + " in " + receiver
 
     def _format_for_iter(self, node):
         # `range(N)` -> `0...N`,  `range(start, stop)` -> `start...stop`.
@@ -2057,6 +2445,14 @@ class HaxeEmitter:
             return '"' + escaped + '"'
         return repr(v)
 
+    def _safe_ident(self, name):
+        # Rename a Python identifier that collides with a Haxe reserved word /
+        # builtin function so it doesn't bind to the builtin. Applied
+        # consistently at definition and use sites.
+        if name in HAXE_RESERVED_IDENTIFIERS:
+            return name + "_"
+        return name
+
     def expr_Name(self, node):
         # Disciplined Python uses self for methods; map to Haxe this.
         if node.id == "self":
@@ -2073,7 +2469,9 @@ class HaxeEmitter:
         # Names like `Exception` need to map to their Haxe equivalents
         # when used as constructor calls (e.g., `raise Exception(...)`).
         # The same map drives type-position translation.
-        return PYTHON_TO_HAXE_TYPES.get(node.id, node.id)
+        if node.id in PYTHON_TO_HAXE_TYPES:
+            return PYTHON_TO_HAXE_TYPES[node.id]
+        return self._safe_ident(node.id)
 
     def expr_BinOp(self, node):
         # printf-style string formatting (`"%g" % value`) has no operator
@@ -2186,6 +2584,12 @@ class HaxeEmitter:
                 b = self.emit_expr(node.args[1])
                 return ("(" + a + " + Math.random() * ((" + b + ") - (" +
                         a + ")))")
+        if module == "time":
+            # time.time() -> seconds since epoch as a Float. Haxe's
+            # haxe.Timer.stamp() gives a monotonic-ish seconds Float, which
+            # matches the only use here (elapsed-time deltas).
+            if attr == "time" and not node.args:
+                return "haxe.Timer.stamp()"
         return None
 
     def expr_JoinedStr(self, node):
@@ -2261,7 +2665,7 @@ class HaxeEmitter:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return ("str",)
         if isinstance(node, ast.List):
-            return ("array",)
+            return self._infer_value_kind(node) or ("array",)
         if isinstance(node, (ast.ListComp,)):
             return ("array",)
         if isinstance(node, ast.DictComp):
@@ -2310,8 +2714,22 @@ class HaxeEmitter:
                     info = self.var_types.get(node.value.id)
                     if info is not None and info[0] == "class":
                         cls_name = info[1]
+            else:
+                # Nested access (`self._state.selected_node`): resolve the
+                # receiver's kind recursively, then look up the field.
+                recv = self._static_kind(node.value)
+                if recv is not None and recv[0] == "class":
+                    cls_name = recv[1]
             if cls_name is not None:
                 return self._field_kind_of_class(cls_name, node.attr)
+        # `a + b` where both sides are arrays is itself an array (the result of
+        # `.concat`), so chained `a + b + c` keeps each step array-typed.
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            lk = self._static_kind(node.left)
+            rk = self._static_kind(node.right)
+            if lk is not None and lk[0] == "array" \
+                    and rk is not None and rk[0] == "array":
+                return ("array",)
         return None
 
     def _set_valued_comp_kind(self, value_node):
@@ -2331,7 +2749,19 @@ class HaxeEmitter:
         # "non-null and non-empty" (maps: non-null); a bare value there is a
         # type error in Haxe. `not x` is already handled by expr_UnaryOp;
         # here we coerce the POSITIVE form. Everything else passes through.
-        if isinstance(node, (ast.UnaryOp, ast.BoolOp, ast.Compare)):
+        if isinstance(node, ast.BoolOp):
+            # In boolean context, `and`/`or` are short-circuit Bool operators:
+            # `&&`/`||` over boolean-coerced operands. (Value context goes
+            # through expr_BoolOp, which selects an operand value instead.)
+            op = BOOLOP_MAP[type(node.op)]
+            my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
+            parent_prec = self._prec_stack[-1]
+            self._prec_stack.append(my_prec)
+            parts = [self._emit_test(v) for v in node.values]
+            self._prec_stack.pop()
+            result = (" " + op + " ").join(parts)
+            return "(" + result + ")" if parent_prec > my_prec else result
+        if isinstance(node, (ast.UnaryOp, ast.Compare)):
             # These already yield a Bool (or handle their own coercion).
             return self.emit_expr(node)
         kind = self._static_kind(node)
@@ -2352,7 +2782,7 @@ class HaxeEmitter:
             if kind is not None and kind[0] in ("str", "array"):
                 inner = self.emit_expr(node.operand)
                 return "(" + inner + " == null || " + inner + ".length == 0)"
-            if kind is not None and kind[0] in ("map", "set"):
+            if kind is not None and kind[0] in ("map", "set", "class"):
                 inner = self.emit_expr(node.operand)
                 return "(" + inner + " == null)"
         op = UNARYOP_MAP.get(type(node.op))
@@ -2369,18 +2799,56 @@ class HaxeEmitter:
         return result
 
     def expr_BoolOp(self, node):
-        op = BOOLOP_MAP[type(node.op)]
-        my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
-        parent_prec = self._prec_stack[-1]
-        self._prec_stack.append(my_prec)
-        # `and`/`or` operands are in boolean context, so a str/array/map
-        # operand needs the same truthiness coercion as an if-condition.
-        parts = [self._emit_test(v) for v in node.values]
-        self._prec_stack.pop()
-        result = (" " + op + " ").join(parts)
-        if parent_prec > my_prec:
-            return "(" + result + ")"
-        return result
+        # Value context (the BoolOp result is consumed as a value, e.g.
+        # `node = a.get(x) or a.get(y)`). Python `or`/`and` yield an OPERAND,
+        # not a Bool: `a or b` -> first truthy operand; `a and b` -> last if
+        # all truthy else the first falsy one. When every operand is itself a
+        # boolean expression, the plain `||`/`&&` form is both correct and
+        # idiomatic; otherwise emit a value-selecting ternary chain so the
+        # result type is the operand type (not Bool).
+        if all(self._is_bool_expr(v) for v in node.values):
+            op = BOOLOP_MAP[type(node.op)]
+            my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
+            parent_prec = self._prec_stack[-1]
+            self._prec_stack.append(my_prec)
+            parts = [self._emit_test(v) for v in node.values]
+            self._prec_stack.pop()
+            result = (" " + op + " ").join(parts)
+            return "(" + result + ")" if parent_prec > my_prec else result
+        # Value-selecting fold, right to left.
+        is_or = isinstance(node.op, ast.Or)
+        acc = self.emit_expr(node.values[-1])
+        for v in reversed(node.values[:-1]):
+            val = self.emit_expr(v)
+            cond = self._truthy(v, val)
+            if is_or:
+                acc = "(" + cond + " ? " + val + " : " + acc + ")"
+            else:
+                acc = "(" + cond + " ? " + acc + " : " + val + ")"
+        return acc
+
+    def _is_bool_expr(self, node):
+        # True if the node already evaluates to a Bool (so `&&`/`||` are valid
+        # without value-selection). Compare/UnaryOp(not)/bool literals qualify;
+        # nested BoolOps qualify iff their operands do.
+        if isinstance(node, ast.Compare):
+            return True
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return True
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return True
+        if isinstance(node, ast.BoolOp):
+            return all(self._is_bool_expr(v) for v in node.values)
+        return False
+
+    def _truthy(self, node, emitted):
+        # A Haxe boolean test for `emitted` matching Python truthiness, used in
+        # the value-selecting `or`/`and` fold. str/array -> non-empty; map ->
+        # non-null; everything else (objects/nullable) -> non-null.
+        kind = self._static_kind(node)
+        if kind is not None and kind[0] in ("str", "array"):
+            return "(" + emitted + " != null && " + emitted + ".length > 0)"
+        return "(" + emitted + " != null)"
 
     def expr_Compare(self, node):
         # Disciplined Python doesn't use comparison chaining (a < b < c).
@@ -2473,6 +2941,30 @@ class HaxeEmitter:
         if isinstance(node.func, ast.Name) and node.func.id == "abs" \
                 and len(node.args) == 1:
             return "Math.abs(" + self.emit_expr(node.args[0]) + ")"
+
+        # print(x) -> trace(x). Haxe's trace is the portable stdout-ish
+        # builtin (the JS/interp targets route it to console/stdout).
+        if isinstance(node.func, ast.Name) and node.func.id == "print" \
+                and not node.keywords:
+            inner = ", ".join(self.emit_expr(a) for a in node.args)
+            return "trace(" + inner + ")"
+
+        # Reflective attribute access by dynamic name: setattr/getattr ->
+        # Reflect.setField / Reflect.field (Haxe's runtime reflection).
+        if isinstance(node.func, ast.Name) and node.func.id == "setattr" \
+                and len(node.args) == 3 and not node.keywords:
+            obj, name, val = (self.emit_expr(a) for a in node.args)
+            return "Reflect.setField(" + obj + ", " + name + ", " + val + ")"
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr" \
+                and len(node.args) in (2, 3) and not node.keywords:
+            obj = self.emit_expr(node.args[0])
+            name = self.emit_expr(node.args[1])
+            field = "Reflect.field(" + obj + ", " + name + ")"
+            if len(node.args) == 3:
+                default = self.emit_expr(node.args[2])
+                return ("(Reflect.hasField(" + obj + ", " + name + ") ? " +
+                        field + " : " + default + ")")
+            return field
 
         # list(iterable) -> a materialized Array. Python's list() turns an
         # iterator (e.g. a Map's keys()) into a concrete list; Haxe has no
@@ -2661,7 +3153,7 @@ class HaxeEmitter:
         # External library calls land here, as do calls on local variables
         # whose type we can't determine without type tracking.
         func = self._format_call_func(node.func, None)
-        args = [self.emit_expr(a) for a in node.args]
+        args = [self._emit_arg(a) for a in node.args]
         for kw in node.keywords:
             args.append("/*kwarg " + kw.arg + "=*/" + self.emit_expr(kw.value))
 
@@ -2702,6 +3194,22 @@ class HaxeEmitter:
         args = [self.emit_expr(a) for a in node.args]
         return "super(" + ", ".join(args) + ")"
 
+    def _emit_arg(self, arg):
+        # Emit a call argument, ascribing a type to an empty `set()`/`dict()`/
+        # `{}` literal so Haxe can resolve the multi-type Map abstract (a bare
+        # `new Map()` in argument position has no inference context).
+        if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) \
+                and arg.func.id == "set" and not arg.args:
+            # A set is modeled as Map<T, Bool>; default key String (Haxe Maps
+            # cannot key on Dynamic).
+            return "(new Map() : Map<String, Bool>)"
+        if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) \
+                and arg.func.id == "dict" and not arg.args:
+            return "(new Map() : Map<Dynamic, Dynamic>)"
+        if isinstance(arg, ast.Dict) and not arg.keys:
+            return "(new Map() : Map<Dynamic, Dynamic>)"
+        return self.emit_expr(arg)
+
     def _looks_like_class_call(self, func_node):
         # Match a bare Name where the identifier is capitalized: Counter()
         if isinstance(func_node, ast.Name):
@@ -2729,6 +3237,11 @@ class HaxeEmitter:
         # Dunder attrs like __init__ are special and excluded.
         if receiver == "this" and self._is_private_name(attr):
             attr = self._strip_private_underscores(attr)
+        # A class-variable (Haxe static) accessed via `self.NAME`: Haxe forbids
+        # instance access to statics, so route through `ClassName.NAME`.
+        if receiver == "this" and self.current_class_name is not None \
+                and node.attr in self.class_statics.get(self.current_class_name, set()):
+            return self.current_class_name + "." + attr
         # Static access on a known class (e.g. `ZIndexEngine._flatten`):
         # private members are declared with their underscores stripped, so
         # the call site must strip too. Guard on the stripped name actually
@@ -2754,7 +3267,29 @@ class HaxeEmitter:
 
     def expr_List(self, node):
         elements = [self.emit_expr(e) for e in node.elts]
-        return "[" + ", ".join(elements) + "]"
+        literal = "[" + ", ".join(elements) + "]"
+        # Heterogeneous literal (e.g. a guide spec `[x, y, x, y, "#00FFFF"]`
+        # mixing Floats and a String): Haxe rejects mixed element types unless
+        # the array is explicitly Array<Dynamic>. Detect a literal mixing
+        # string and numeric constants and force the type.
+        if self._is_heterogeneous_literal(node):
+            return "([" + ", ".join(elements) + "] : Array<Dynamic>)"
+        return literal
+
+    def _is_heterogeneous_literal(self, node):
+        # True if the list literal mixes string and numeric constant elements.
+        has_str = False
+        has_num = False
+        for e in node.elts:
+            if isinstance(e, ast.Constant):
+                if isinstance(e.value, str):
+                    has_str = True
+                elif isinstance(e.value, (int, float)) and not isinstance(e.value, bool):
+                    has_num = True
+            elif isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub) \
+                    and isinstance(e.operand, ast.Constant):
+                has_num = True
+        return has_str and has_num
 
     def _emit_iterable(self, node):
         # Emit an expression for use as a Haxe `for (x in <here>)` source.
@@ -2796,6 +3331,14 @@ class HaxeEmitter:
         true_node = ast.copy_location(ast.Constant(value=True), node)
         return self._emit_comprehension(node, true_node, node.elt)
 
+    def _comp_gen_header(self, gen):
+        # Haxe `for (...)` header for one comprehension generator. Handles
+        # `k, v in m.items()` -> `k => v in m`; otherwise `target in iterable`.
+        kv = self._items_kv_target(gen.target, gen.iter)
+        if kv is not None:
+            return kv
+        return self.emit_expr(gen.target) + " in " + self._emit_iterable(gen.iter)
+
     def _emit_comprehension(self, node, value_elt, key_elt):
         # Shared engine. key_elt is None for list comprehensions (array
         # result) and set when building a Map (DictComp/SetComp). Generators
@@ -2808,9 +3351,7 @@ class HaxeEmitter:
             # Array comprehension. Compose: [for (g0) if(c..) for(g1)... elt]
             parts = []
             for gen in gens:
-                target = self.emit_expr(gen.target)
-                iterable = self._emit_iterable(gen.iter)
-                parts.append("for (" + target + " in " + iterable + ") ")
+                parts.append("for (" + self._comp_gen_header(gen) + ") ")
                 for cond in gen.ifs:
                     parts.append("if (" + self._emit_test(cond) + ") ")
             elt = self.emit_expr(value_elt)
@@ -2819,9 +3360,7 @@ class HaxeEmitter:
         m = self._fresh_tmp()
         chunks = ["{ var " + m + " = new Map(); "]
         for gen in gens:
-            target = self.emit_expr(gen.target)
-            iterable = self._emit_iterable(gen.iter)
-            chunks.append("for (" + target + " in " + iterable + ") ")
+            chunks.append("for (" + self._comp_gen_header(gen) + ") ")
             for cond in gen.ifs:
                 chunks.append("if (" + self._emit_test(cond) + ") ")
         chunks.append(m + ".set(" + self.emit_expr(key_elt) + ", " +
@@ -2957,9 +3496,10 @@ class HaxeEmitter:
 # CLI
 # ============================================================
 
-def convert(source, filename="<input>"):
+def convert(source, filename="<input>", shared_tuples=False):
     tree = ast.parse(source, filename=filename)
     emitter = HaxeEmitter()
+    emitter.shared_tuples = shared_tuples
     # Derive the module class name from the source filename (Milestone 8).
     # `<input>` / no real path keeps the historical "Main" default so
     # single-snippet conversions are unchanged.
@@ -2974,6 +3514,12 @@ def convert(source, filename="<input>"):
     emitter.emit_module(tree)
     emitter._drain_remaining_comments()
     return emitter.output()
+
+
+def emit_tuples_module(arities):
+    # Produce a standalone `Tuples.hx` defining TupleN for each given arity —
+    # the shared home used with `convert(..., shared_tuples=True)`.
+    return HaxeEmitter().emit_tuples_module(arities)
 
 
 def _extract_comments(source):
@@ -2997,15 +3543,26 @@ def _extract_comments(source):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: haxe_emitter.py FILE.py", file=sys.stderr)
+    args = sys.argv[1:]
+    shared_tuples = False
+    if "--shared-tuples" in args:
+        shared_tuples = True
+        args = [a for a in args if a != "--shared-tuples"]
+    # `--emit-tuples A B ...` writes a standalone Tuples.hx for those arities.
+    if args and args[0] == "--emit-tuples":
+        arities = [int(a) for a in args[1:]] or [2, 3, 4]
+        print(emit_tuples_module(arities))
+        return 0
+    if len(args) != 1:
+        print("usage: haxe_emitter.py [--shared-tuples] FILE.py", file=sys.stderr)
+        print("       haxe_emitter.py --emit-tuples N [N...]", file=sys.stderr)
         return 1
-    f = open(sys.argv[1], "r")
+    f = open(args[0], "r")
     try:
         source = f.read()
     finally:
         f.close()
-    print(convert(source, sys.argv[1]))
+    print(convert(source, args[0], shared_tuples=shared_tuples))
     return 0
 
 

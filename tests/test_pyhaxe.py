@@ -240,6 +240,91 @@ def test_map_values_iteration():
     assert "for (v in m)" in out, out
 
 
+def test_del_map_and_list():
+    source = (
+        "def f(xs: list, m: dict, k: str) -> None:\n"
+        "    del xs[2]\n"
+        "    del m[k]\n"
+    )
+    out = convert(source, "<test>")
+    assert "xs.splice(2, 1);" in out, out
+    assert "m.remove(k);" in out, out
+
+
+def test_dict_items_iteration_keyvalue():
+    source = (
+        "def f(m: dict) -> int:\n"
+        "    total = 0\n"
+        "    for k, v in m.items():\n"
+        "        total = total + v\n"
+        "    return total\n"
+    )
+    out = convert(source, "<test>")
+    # Haxe key-value iteration; no `.items()` method exists.
+    assert "for (k => v in m)" in out, out
+    assert ".items()" not in out, out
+
+
+def test_class_variable_becomes_static():
+    source = (
+        "class C:\n"
+        "    LABELS = [\"a\", \"b\"]\n"
+        "    def first(self) -> str:\n"
+        "        return self.LABELS[0]\n"
+    )
+    out = convert(source, "<test>")
+    assert "static var LABELS" in out, out
+    # Instance access to a static is rewritten to ClassName.NAME.
+    assert "C.LABELS[0]" in out, out
+
+
+def test_or_value_selection_for_objects():
+    source = (
+        "def f(m: dict, a: str, b: str) -> str:\n"
+        "    return m.get(a) or m.get(b)\n"
+    )
+    out = convert(source, "<test>")
+    # Python `or` on values yields an operand (ternary), not a Bool `||`.
+    assert "?" in out and "||" not in out, out
+
+
+def test_not_on_nullable_object_is_null_check():
+    source = (
+        "from typing import Dict\n"
+        "class N:\n"
+        "    x: int\n"
+        "    def __init__(self, x: int) -> None:\n"
+        "        self.x = x\n"
+        "def f(m: Dict[str, N], k: str) -> bool:\n"
+        "    n = m.get(k)\n"
+        "    if not n:\n"
+        "        return True\n"
+        "    return False\n"
+    )
+    out = convert(source, "<test>")
+    # `not n` on a tracked nullable (Dict value is a class) -> explicit null
+    # test, not `!n`.
+    assert "n == null" in out, out
+
+
+def test_setattr_getattr_to_reflect():
+    source = (
+        "def f(o: object, name: str, v: str) -> None:\n"
+        "    setattr(o, name, v)\n"
+    )
+    out = convert(source, "<test>")
+    assert "Reflect.setField(o, name, v)" in out, out
+
+
+def test_print_maps_to_trace():
+    source = (
+        "def f(x: str) -> None:\n"
+        "    print(x)\n"
+    )
+    out = convert(source, "<test>")
+    assert "trace(x)" in out, out
+
+
 # ============================================================
 # CLI smoke test
 # ============================================================
