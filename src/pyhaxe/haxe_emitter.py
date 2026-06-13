@@ -773,12 +773,21 @@ class HaxeEmitter:
             methods = set()
             method_signatures = {}
             fields = set()
+            # Map field name -> its declared annotation node, so attribute
+            # accesses can be type-directed (truthiness, subscript, etc.).
+            field_annotations = {}
             for item in stmt.body:
                 if isinstance(item, ast.FunctionDef):
                     methods.add(item.name)
                     method_signatures[item.name] = self._build_signature(item)
-                    # Fields are also bound as `self.x = ...` in __init__.
+                    # Fields are also bound as `self.x = ...` in __init__;
+                    # their declared types come from the matching parameter
+                    # annotation when the assignment is `self.x = x`.
                     if item.name == "__init__":
+                        param_anns = {}
+                        for a in item.args.args:
+                            if a.annotation is not None:
+                                param_anns[a.arg] = a.annotation
                         for sub in ast.walk(item):
                             if isinstance(sub, ast.Assign):
                                 for tgt in sub.targets:
@@ -786,13 +795,21 @@ class HaxeEmitter:
                                             and isinstance(tgt.value, ast.Name) \
                                             and tgt.value.id == "self":
                                         fields.add(tgt.attr)
+                                        if isinstance(sub.value, ast.Name) \
+                                                and sub.value.id in param_anns:
+                                            field_annotations.setdefault(
+                                                tgt.attr,
+                                                param_anns[sub.value.id])
                 elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
                     fields.add(item.target.id)
+                    if item.annotation is not None:
+                        field_annotations[item.target.id] = item.annotation
             self.classes[stmt.name] = {
                 "bases": bases,
                 "methods": methods,
                 "method_signatures": method_signatures,
                 "fields": fields,
+                "field_annotations": field_annotations,
             }
 
     def _scan_functions(self, module_node):
@@ -952,6 +969,36 @@ class HaxeEmitter:
             if base_name == ancestor or self._is_subclass_of(base_name, ancestor):
                 return True
         return False
+
+    def _field_annotation_of_class(self, class_name, attr):
+        # Return the annotation AST node for `attr` on class_name, searching
+        # the class itself, its ancestors, and — for the tagged-union
+        # downcast idiom (a base-typed receiver whose attr lives only on a
+        # subclass) — its subclasses. Returns None when unknown.
+        cls = self.classes.get(class_name)
+        if cls is None:
+            return None
+        anns = cls.get("field_annotations", {})
+        if attr in anns:
+            return anns[attr]
+        for base_name in cls["bases"]:
+            found = self._field_annotation_of_class(base_name, attr)
+            if found is not None:
+                return found
+        # Downcast case: the attr is declared only on a subclass.
+        for name, info in self.classes.items():
+            if name == class_name:
+                continue
+            if attr in info.get("field_annotations", {}) \
+                    and self._is_subclass_of(name, class_name):
+                return info["field_annotations"][attr]
+        return None
+
+    def _field_kind_of_class(self, class_name, attr):
+        # Type-kind tuple of `attr` on class_name (str/array/map/...), or
+        # None. Drives type-directed truthiness/membership on attributes.
+        ann = self._field_annotation_of_class(class_name, attr)
+        return self._type_kind_of(ann)
 
     # === Statements ===
 
@@ -1507,7 +1554,7 @@ class HaxeEmitter:
         self._emit_if_chain(node, False)
 
     def _emit_if_chain(self, node, is_elif):
-        cond = self.emit_expr(node.test)
+        cond = self._emit_test(node.test)
         keyword = "} else if" if is_elif else "if"
         self.line(keyword + " (" + cond + ") {")
         self.indent_level += 1
@@ -1530,7 +1577,7 @@ class HaxeEmitter:
         self.line("}")
 
     def stmt_While(self, node):
-        cond = self.emit_expr(node.test)
+        cond = self._emit_test(node.test)
         self.line("while (" + cond + ") {")
         self.indent_level += 1
         self._emit_block_body(node.body)
@@ -1759,7 +1806,41 @@ class HaxeEmitter:
             base = self.var_types.get(node.value.id)
             if base is not None and base[0] == "str":
                 return ("str",)
+        # Attribute access: `recv.attr`. Resolve the receiver's class and
+        # look up the field's declared type. Covers both `self.f` and a
+        # tracked local of known class type, including base-typed receivers
+        # whose attr lives on a subclass (the tagged-union downcast idiom —
+        # the same access expr_Attribute routes through `(cast x)`).
+        if isinstance(node, ast.Attribute):
+            cls_name = None
+            if isinstance(node.value, ast.Name):
+                if node.value.id == "self":
+                    cls_name = self.current_class_name
+                else:
+                    info = self.var_types.get(node.value.id)
+                    if info is not None and info[0] == "class":
+                        cls_name = info[1]
+            if cls_name is not None:
+                return self._field_kind_of_class(cls_name, node.attr)
         return None
+
+    def _emit_test(self, node):
+        # Emit an expression used in boolean context (if/while condition,
+        # `and`/`or` operand). Python truthiness on a str/array/map means
+        # "non-null and non-empty" (maps: non-null); a bare value there is a
+        # type error in Haxe. `not x` is already handled by expr_UnaryOp;
+        # here we coerce the POSITIVE form. Everything else passes through.
+        if isinstance(node, (ast.UnaryOp, ast.BoolOp, ast.Compare)):
+            # These already yield a Bool (or handle their own coercion).
+            return self.emit_expr(node)
+        kind = self._static_kind(node)
+        if kind is not None and kind[0] in ("str", "array"):
+            inner = self.emit_expr(node)
+            return "(" + inner + " != null && " + inner + ".length > 0)"
+        if kind is not None and kind[0] == "map":
+            inner = self.emit_expr(node)
+            return "(" + inner + " != null)"
+        return self.emit_expr(node)
 
     def expr_UnaryOp(self, node):
         # Type-directed truthiness for `not x`. Python `not s` / `not arr`
@@ -1791,7 +1872,9 @@ class HaxeEmitter:
         my_prec = OPERATOR_PRECEDENCE.get(type(node.op), 0)
         parent_prec = self._prec_stack[-1]
         self._prec_stack.append(my_prec)
-        parts = [self.emit_expr(v) for v in node.values]
+        # `and`/`or` operands are in boolean context, so a str/array/map
+        # operand needs the same truthiness coercion as an if-condition.
+        parts = [self._emit_test(v) for v in node.values]
         self._prec_stack.pop()
         result = (" " + op + " ").join(parts)
         if parent_prec > my_prec:

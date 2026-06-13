@@ -115,6 +115,52 @@ def _check_golden(stem):
 
 
 # ============================================================
+# Type-directed truthiness (regression: positive string truthiness)
+# ============================================================
+
+def test_positive_string_truthiness_on_field_is_coerced():
+    # `if self.prop:` where prop is a str must become a non-null/non-empty
+    # test in Haxe, not a bare `if (prop)` (which drops the value / is a
+    # type error). Regression for the serialize() prop-dropping bug.
+    source = (
+        "class RefExpr:\n"
+        "    prop: str\n"
+        "    def __init__(self, prop: str) -> None:\n"
+        "        self.prop = prop\n"
+        "    def show(self) -> str:\n"
+        "        if self.prop:\n"
+        "            return self.prop\n"
+        "        return \"\"\n"
+    )
+    out = convert(source, "<test>")
+    assert "this.prop != null && this.prop.length > 0" in out, out
+
+
+def test_positive_string_truthiness_via_downcast_is_coerced():
+    # Base-typed receiver whose str field lives on a subclass: the access
+    # is routed through `(cast x)` and still needs truthiness coercion.
+    source = (
+        "class Expr:\n"
+        "    kind: str\n"
+        "    def __init__(self, kind: str) -> None:\n"
+        "        self.kind = kind\n"
+        "\n"
+        "class RefExpr(Expr):\n"
+        "    prop: str\n"
+        "    def __init__(self, prop: str) -> None:\n"
+        "        super().__init__(\"ref\")\n"
+        "        self.prop = prop\n"
+        "\n"
+        "def serialize(node: Expr) -> str:\n"
+        "    if node.prop:\n"
+        "        return node.prop\n"
+        "    return \"\"\n"
+    )
+    out = convert(source, "<test>")
+    assert "(cast node).prop != null && (cast node).prop.length > 0" in out, out
+
+
+# ============================================================
 # CLI smoke test
 # ============================================================
 
