@@ -295,6 +295,19 @@ class HaxeEmitter:
         # name is seen and a bare assignment thereafter. Saved/restored at
         # each function boundary alongside var_types.
         self.declared_vars = set()
+        # Nested (local) functions visible in the current body, mapping
+        # name -> return-type kind tuple (or None). Module/class-level
+        # functions live in self.functions; nested `def`s defined inside a
+        # method body are otherwise invisible to type-directed logic, so a
+        # call to one (e.g. the recursive `find_back_edge` in SnapDrag) can't
+        # have its result coerced for boolean context. Saved/restored at each
+        # function boundary like var_types.
+        self.local_functions = {}
+        # Pending `@<name>.setter` methods for the class currently being
+        # emitted, mapping the property's raw Python name -> the setter
+        # FunctionDef. Populated in stmt_ClassDef so the paired `@property`
+        # getter emits a `(get, set)` property (F3).
+        self._property_setters = {}
         # Kind tuple of the current function's declared return type, used to
         # insert a downcast when returning a base-typed value where a
         # subclass is declared (tagged-union pattern). Set per body entry.
@@ -784,6 +797,19 @@ class HaxeEmitter:
             for stmt in module_consts:
                 self._emit_module_constant(stmt)
             self.line("")
+        # F2: a module-level `def main()` plus an `if __name__ == "__main__"`
+        # guard would BOTH want to emit `static function main()`. In Haxe,
+        # `-main Module` auto-invokes `Module.main()`, so a user `def main()`
+        # already serves as the entry point and the guard body (which in
+        # disciplined code just calls `main()`) is redundant. When a user
+        # `main` function is present, emit it as the entry and suppress the
+        # synthetic wrapper, unless the guard body does more than invoke
+        # `main()` — in that case the synthetic wrapper still carries the
+        # extra startup statements but skips the now-duplicate `main()` call.
+        user_main = any(f.name == "main" for f in free_functions)
+        if user_main and main_body:
+            main_body = [s for s in main_body
+                         if not self._is_bare_call_to(s, "main")]
         # Emit each free function as a static method.
         for func in free_functions:
             self._emit_static_function_in_class(func)
@@ -799,14 +825,27 @@ class HaxeEmitter:
             self.in_class = saved_in_class
             self.indent_level -= 1
             self.line("}")
-        else:
-            # No main() body — still emit a stub so Haxe has an entry.
+        elif not user_main:
+            # No main() body and no user-defined main — still emit a stub so
+            # Haxe has an entry. (When a user `main` exists it IS the entry.)
             self.line("public static function main():Void {}")
         self.in_class = prev_in_class
         self.current_class_name = prev_class_name
         self.indent_level -= 1
         self.line("}")
         self.line("")
+
+    def _is_bare_call_to(self, stmt, name):
+        # True if `stmt` is `name()` (a no-arg call to the given function as a
+        # statement). Used to strip the redundant `main()` from a
+        # `if __name__ == "__main__":` guard body when a user `def main`
+        # already provides the entry point (F2).
+        return (isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == name
+                and not stmt.value.args
+                and not stmt.value.keywords)
 
     def _emit_module_constant(self, stmt):
         # Emit a module-level constant/global as a public static field on
@@ -847,14 +886,18 @@ class HaxeEmitter:
             self.in_class = False
             prev_var_types = dict(self.var_types)
             prev_declared = self.declared_vars
+            prev_local_funcs = self.local_functions
+            self.local_functions = dict(prev_local_funcs)
             self.declared_vars = set()
             self._return_kind = self._type_kind_of(node.returns)
             self._emit_options_prelude(signature)
+            self._register_local_functions(node.body)
             for stmt in node.body:
                 self.emit_stmt(stmt)
             self.in_class = prev_in_class
             self.var_types = prev_var_types
             self.declared_vars = prev_declared
+            self.local_functions = prev_local_funcs
             self.indent_level -= 1
             self.line("}")
             self.line("")
@@ -869,14 +912,18 @@ class HaxeEmitter:
         self.in_class = False
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
+        prev_local_funcs = self.local_functions
+        self.local_functions = dict(prev_local_funcs)
         self.declared_vars = set()
         self._return_kind = self._type_kind_of(node.returns)
         self._register_param_var_types(node.args)
+        self._register_local_functions(node.body)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
         self.var_types = prev_var_types
         self.declared_vars = prev_declared
+        self.local_functions = prev_local_funcs
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -1493,14 +1540,18 @@ class HaxeEmitter:
         self.indent_level += 1
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
+        prev_local_funcs = self.local_functions
+        self.local_functions = dict(prev_local_funcs)
         self.declared_vars = set()
         self._return_kind = self._type_kind_of(node.returns)
         self._register_param_var_types(node.args)
+        self._register_local_functions(node.body)
         self._hoist_branch_locals(node.body)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.var_types = prev_var_types
         self.declared_vars = prev_declared
+        self.local_functions = prev_local_funcs
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -1555,6 +1606,17 @@ class HaxeEmitter:
             self.line("var " + name + ";")
             self.declared_vars.add(name)
 
+    def _register_local_functions(self, body):
+        # Record the return-type kind of any nested `def` directly in this
+        # body, so calls to them resolve a static kind (drives boolean-context
+        # coercion of the result — e.g. a nested function declared `-> bool`
+        # vs `-> Optional[_BackEdge]`). Only the immediate body is scanned;
+        # the registry is scoped to the enclosing function and restored on
+        # exit.
+        for stmt in body:
+            if isinstance(stmt, ast.FunctionDef):
+                self.local_functions[stmt.name] = self._type_kind_of(stmt.returns)
+
     def _register_param_var_types(self, args):
         # Record each parameter's type kind in var_types so subscript,
         # slice, and membership operators can branch on str vs Array vs
@@ -1583,6 +1645,8 @@ class HaxeEmitter:
         if isinstance(type_node, ast.Name):
             if type_node.id == "str":
                 return ("str",)
+            if type_node.id == "bool":
+                return ("bool",)
             if type_node.id in ("list", "List"):
                 return ("array",)
             if type_node.id in ("dict", "Dict"):
@@ -1848,12 +1912,30 @@ class HaxeEmitter:
                 type_str = self.emit_type(ann) if ann is not None else "Dynamic"
                 self.line(vis + " var " + out_name + ":" + type_str + ";")
 
+        # F3: collect `@<name>.setter` methods so the matching `@property`
+        # getter can emit a full `var name(get, set)` property with both a
+        # get_name and set_name accessor, instead of a read-only
+        # `(get, never)` plus a colliding same-named setter method.
+        property_setters = {}
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                setter_for = self._property_setter_target(stmt)
+                if setter_for is not None:
+                    property_setters[setter_for] = stmt
+        self._property_setters = property_setters
+
         for stmt in node.body:
             # Skip docstrings inside class bodies.
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
                     and isinstance(stmt.value.value, str):
                 continue
+            # Setter methods are emitted by their paired property getter; skip
+            # them here so they don't also emit as a standalone method (F3).
+            if isinstance(stmt, ast.FunctionDef) \
+                    and self._property_setter_target(stmt) is not None:
+                continue
             self.emit_stmt(stmt)
+        self._property_setters = {}
 
         # Fold in module-level constants and free functions when this class's
         # name collides with the module holder name (see emit_module).
@@ -1978,6 +2060,8 @@ class HaxeEmitter:
         self.in_class = False
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
+        prev_local_funcs = self.local_functions
+        self.local_functions = dict(prev_local_funcs)
         self.declared_vars = set()
         self._return_kind = self._type_kind_of(node.returns)
         if not uses_options:
@@ -1986,38 +2070,99 @@ class HaxeEmitter:
         # the rest of the body can use the parameter names as locals.
         if uses_options:
             self._emit_options_prelude(signature)
+        self._register_local_functions(node.body)
         self._hoist_branch_locals(node.body)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
         self.var_types = prev_var_types
         self.declared_vars = prev_declared
+        self.local_functions = prev_local_funcs
         self.indent_level -= 1
         self.line("}")
         self.line("")
 
+    def _property_setter_target(self, node):
+        # If `node` is a `@<name>.setter`-decorated method, return <name>;
+        # else None. Python spells a property setter as
+        # `@prop.setter def prop(self, value): ...`, which parses to a
+        # decorator `Attribute(value=Name('prop'), attr='setter')`.
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Attribute) and dec.attr == "setter" \
+                    and isinstance(dec.value, ast.Name):
+                return dec.value.id
+        return None
+
     def _emit_property_getter(self, node):
-        # Emit `public var <name>(get, never):<Ret>;` plus the accessor
-        # `function get_<name>():<Ret> { ...body... }`. read-only (never set).
+        # Python `@property` (+ optional `@name.setter`) -> a Haxe property.
+        # With no setter: `var name(get, never)` + `get_name` (read-only).
+        # With a setter (F3): `var name(get, set)` + `get_name` + `set_name`,
+        # so `this.name = value` resolves to the setter instead of failing
+        # with "cannot be accessed for writing".
         is_private = self._is_private_name(node.name)
         visibility = "private" if is_private else "public"
         name = self._strip_private_underscores(node.name)
         ret = self.emit_type(node.returns)
-        self.line(visibility + " var " + name + "(get, never):" + ret + ";")
+        setter = getattr(self, "_property_setters", {}).get(node.name)
+        access = "set" if setter is not None else "never"
+        self.line(visibility + " var " + name + "(get, " + access + "):" + ret + ";")
         self.line(visibility + " function get_" + name + "():" + ret + " {")
+        self._emit_accessor_body(node, ret)
+        if setter is not None:
+            self._emit_property_setter(setter, name, visibility)
+
+    def _emit_property_setter(self, node, name, visibility):
+        # Emit `function set_<name>(value:T):T { ...body...; return value; }`
+        # for a `@name.setter`. Haxe property setters must return the assigned
+        # value's type; the Python setter returns None, so we mirror the
+        # incoming parameter type and append `return <param>;`.
+        non_self = [a for a in node.args.args if a.arg not in ("self", "cls")]
+        param = non_self[0] if non_self else None
+        value_name = param.arg if param is not None else "value"
+        value_type = self.emit_type(param.annotation) \
+            if param is not None and param.annotation is not None else "Dynamic"
+        self.line(visibility + " function set_" + name +
+                  "(" + value_name + ":" + value_type + "):" + value_type + " {")
         self.indent_level += 1
         prev_in_class = self.in_class
         self.in_class = False
         prev_var_types = dict(self.var_types)
         prev_declared = self.declared_vars
+        prev_local_funcs = self.local_functions
+        self.local_functions = dict(prev_local_funcs)
+        self.declared_vars = set()
+        self._return_kind = None
+        self._register_param_var_types(node.args)
+        self._register_local_functions(node.body)
+        for stmt in node.body:
+            self.emit_stmt(stmt)
+        self.line("return " + value_name + ";")
+        self.in_class = prev_in_class
+        self.var_types = prev_var_types
+        self.declared_vars = prev_declared
+        self.local_functions = prev_local_funcs
+        self.indent_level -= 1
+        self.line("}")
+        self.line("")
+
+    def _emit_accessor_body(self, node, ret):
+        self.indent_level += 1
+        prev_in_class = self.in_class
+        self.in_class = False
+        prev_var_types = dict(self.var_types)
+        prev_declared = self.declared_vars
+        prev_local_funcs = self.local_functions
+        self.local_functions = dict(prev_local_funcs)
         self.declared_vars = set()
         self._return_kind = self._type_kind_of(node.returns)
         self._register_param_var_types(node.args)
+        self._register_local_functions(node.body)
         for stmt in node.body:
             self.emit_stmt(stmt)
         self.in_class = prev_in_class
         self.var_types = prev_var_types
         self.declared_vars = prev_declared
+        self.local_functions = prev_local_funcs
         self.indent_level -= 1
         self.line("}")
         self.line("")
@@ -2686,6 +2831,22 @@ class HaxeEmitter:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                 and node.func.id == "sorted":
             return ("array",)
+        # A call to a function/method/constructor we have a signature for:
+        # use its declared return-type kind. This surfaces Bool-returning
+        # calls (e.g. `_is_name_start(ch)`, `is_dependent(a, b)`) so a
+        # value-context `or`/`and` over them lowers to `||`/`&&` (F1), and
+        # class-typed returns so a truthiness test lowers to `!= null` (F4b).
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) \
+                    and node.func.id in self.local_functions:
+                lk = self.local_functions[node.func.id]
+                if lk is not None:
+                    return lk
+            sig, _kind, _name = self._lookup_signature(node)
+            if sig is not None:
+                rk = self._type_kind_of(sig.get("returns"))
+                if rk is not None:
+                    return rk
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             # `s.strip()` -> str; `.charAt`/`.substring` -> str. These are
             # the string ops the emitter produces.
@@ -2765,10 +2926,18 @@ class HaxeEmitter:
             # These already yield a Bool (or handle their own coercion).
             return self.emit_expr(node)
         kind = self._static_kind(node)
+        if kind is not None and kind[0] == "bool":
+            # Already a Bool — no truthiness coercion needed.
+            return self.emit_expr(node)
         if kind is not None and kind[0] in ("str", "array"):
             inner = self.emit_expr(node)
             return "(" + inner + " != null && " + inner + ".length > 0)"
-        if kind is not None and kind[0] in ("map", "set"):
+        if kind is not None and kind[0] in ("map", "set", "class"):
+            # Map/set/object value in boolean context — Python truthiness on a
+            # nullable object means "is it present". Haxe rejects a bare
+            # Null<T> as Bool, so coerce to a null check. Covers F5 (`if
+            # (state)`, `if (artboard)`) and F4b (`... or find_back_edge(...)`,
+            # where the nested function returns Null<_BackEdge>).
             inner = self.emit_expr(node)
             return "(" + inner + " != null)"
         return self.emit_expr(node)
@@ -2830,7 +2999,12 @@ class HaxeEmitter:
     def _is_bool_expr(self, node):
         # True if the node already evaluates to a Bool (so `&&`/`||` are valid
         # without value-selection). Compare/UnaryOp(not)/bool literals qualify;
-        # nested BoolOps qualify iff their operands do.
+        # nested BoolOps qualify iff their operands do. A node whose static
+        # kind is Bool (a bool-typed name/field/param, or a call to a function
+        # or method declared `-> bool`) also qualifies — this is what keeps a
+        # value-context `or`/`and` over Bool operands from being lowered to the
+        # `(A != null ? A : B)` null-ternary, which the static Java target
+        # rejects on a basic Bool (F1).
         if isinstance(node, ast.Compare):
             return True
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -2839,6 +3013,9 @@ class HaxeEmitter:
             return True
         if isinstance(node, ast.BoolOp):
             return all(self._is_bool_expr(v) for v in node.values)
+        kind = self._static_kind(node)
+        if kind is not None and kind[0] == "bool":
+            return True
         return False
 
     def _truthy(self, node, emitted):
@@ -2924,6 +3101,23 @@ class HaxeEmitter:
         if isinstance(node.func, ast.Name) and node.func.id == "hex" \
                 and len(node.args) == 1:
             return '("0x" + StringTools.hex(' + self.emit_expr(node.args[0]) + "))"
+
+        # str.rsplit(sep, 1) -> split on the LAST occurrence of sep, yielding
+        # a 2-element Array [before, after] (or [s] when sep is absent). Haxe's
+        # String has no rsplit; only the maxsplit==1 form has a clean,
+        # allocation-light lowering and is the only form disciplined code uses
+        # (e.g. `filename.rsplit(".", 1)[0]`). (F7)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "rsplit" \
+                and len(node.args) == 2 and not node.keywords \
+                and isinstance(node.args[1], ast.Constant) \
+                and node.args[1].value == 1:
+            receiver = self.emit_expr(node.func.value)
+            sep = self.emit_expr(node.args[0])
+            return ("(function(_s:String, _sep:String):Array<String> {"
+                    " var _i = _s.lastIndexOf(_sep);"
+                    " return _i == -1 ? [_s] :"
+                    " [_s.substring(0, _i), _s.substring(_i + _sep.length)]; })("
+                    + receiver + ", " + sep + ")")
 
         # str.zfill(w) -> StringTools.lpad(s, "0", w): left-pad with zeros.
         if isinstance(node.func, ast.Attribute) and node.func.attr == "zfill" \
@@ -3211,10 +3405,14 @@ class HaxeEmitter:
         return self.emit_expr(arg)
 
     def _looks_like_class_call(self, func_node):
-        # Match a bare Name where the identifier is capitalized: Counter()
+        # Match a bare Name whose identifier is a class name: capitalized
+        # (Counter()) or a private/local class following the leading-
+        # underscore convention with a capitalized stem (_BackEdge() — F4a).
+        # Such a name emits as a Haxe class, so the call needs `new`.
         if isinstance(func_node, ast.Name):
             name = func_node.id
-            return len(name) > 0 and name[0].isupper()
+            stem = name.lstrip("_")
+            return len(stem) > 0 and stem[0].isupper()
         # Don't treat Foo.bar() as construction even if Foo is a class —
         # that's a static method call, which is just `Foo.bar()` in Haxe.
         return False
