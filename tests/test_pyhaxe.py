@@ -307,6 +307,51 @@ def test_not_on_nullable_object_is_null_check():
     assert "n == null" in out, out
 
 
+def test_dynamic_truthiness_lowers_to_runtime_truthy():
+    # F8: `if self.f:` where `f` is Dynamic/unknown-kind (typed `Any`, set from
+    # a Dynamic-returning call — mirrors the editor's `_snap_clock` scheduler
+    # handle) must NOT pass through bare. A bare `if (dynamic)` makes hxjava
+    # emit a hard `(java.lang.Boolean) Object` cast that ClassCastExceptions at
+    # runtime. It must lower to the null-safe Python-semantic helper instead.
+    source = (
+        "from typing import Any\n"
+        "class Ui:\n"
+        "    def schedule(self) -> Any:\n"
+        "        return None\n"
+        "class SnapDrag:\n"
+        "    _clock: Any\n"
+        "    def __init__(self, ui: Ui) -> None:\n"
+        "        self._ui = ui\n"
+        "        self._clock = None\n"
+        "    def start(self) -> None:\n"
+        "        self._clock = self._ui.schedule()\n"
+        "    def stop(self) -> None:\n"
+        "        if self._clock:\n"
+        "            self._clock = None\n"
+        "    def stop_neg(self) -> None:\n"
+        "        if not self._clock:\n"
+        "            self._clock = None\n"
+    )
+    out = convert(source, "<test>")
+    # Positive form: `Pyhaxe.truthy(...)`, not a bare `if (this.clock)`.
+    assert "if (Pyhaxe.truthy(this.clock))" in out, out
+    # Negated form: `!Pyhaxe.truthy(...)`, not a bare `if (!this.clock)`.
+    assert "if (!Pyhaxe.truthy(this.clock))" in out, out
+    # The cast-prone bare forms must be gone entirely.
+    assert "if (this.clock)" not in out, out
+    assert "if (!this.clock)" not in out, out
+
+
+def test_runtime_module_defines_truthy():
+    # The shared `Pyhaxe.hx` runtime module (emitted alongside Tuples.hx) must
+    # define the Python-semantic truthy() helper, null-safe and primitive-aware.
+    from pyhaxe.haxe_emitter import emit_runtime_module
+    out = emit_runtime_module()
+    assert "class Pyhaxe" in out, out
+    assert "public static function truthy(x:Dynamic):Bool" in out, out
+    assert "if (x == null) return false;" in out, out
+
+
 def test_setattr_getattr_to_reflect():
     source = (
         "def f(o: object, name: str, v: str) -> None:\n"
