@@ -1,6 +1,4 @@
-*note: early days*
-
-# disciplined-haxe
+# PyHaxe
 
 A linter and transpiler that lets you write Python and ship Haxe.
 
@@ -12,7 +10,7 @@ Python's syntax is among the most refined available, but writing Python locks yo
 
 This project takes a different approach. Define a Python subset that maps cleanly onto major target languages, provide tools to enforce the subset, and emit target-language source mechanically. You write Python. You debug in Python. You ship Haxe — and through Haxe, anything Haxe targets (JavaScript, Java, C++, C#, PHP, Lua, and others).
 
-The cost is discipline: type annotations everywhere, no lambdas, no `with`, no tuple unpacking, wrappers for non-portable APIs. The benefit is one source of truth that runs anywhere.
+The cost is discipline: type annotations everywhere, no lambdas, no `with`, wrappers for non-portable APIs. The benefit is one source of truth that runs anywhere.
 
 ## Quick example
 
@@ -31,7 +29,7 @@ def classify(value: int) -> str:
 Compiles to this Haxe:
 
 ```haxe
-function classify(value:Int):String {
+public static function classify(value:Int):String {
     if (value > 0) {
         return "positive";
     } else if (value < 0) {
@@ -46,46 +44,46 @@ The transformation is mechanical — keyword and type renames, brace insertion, 
 
 ## Status
 
-Early development. Milestone 1 of the emitter is verified working on a small example program. The discipline checker is functional and tested against deliberate-violation examples.
+The transpiler is functional and verified end-to-end. Real disciplined-Python programs translate to Haxe source that compiles with the official `haxe` compiler and produces correct output across Haxe's targets (verified on JavaScript via Node.js).
 
 | Component | Status |
 |-----------|--------|
 | Discipline checker (linter) | complete |
-| Emitter — Milestone 1: functions, expressions, control flow | complete |
-| Emitter — Milestone 2: classes, fields, methods, inheritance | planned |
-| Emitter — Milestone 3: collections and iteration | planned |
-| Emitter — Milestone 4: wrapper handling (`@haxe_extern`) | planned |
-| Emitter — Milestone 5: signature-aware kwargs resolution | planned |
-| Emitter — Milestone 6: try/except, raise | planned |
-| Emitter — Milestone 7: extended type system (Optional, List, Dict) | planned |
-| Emitter — Milestone 8: imports and module organization | complete |
-| Polish — comment preservation, formatting, error reporting | planned |
+| Functions, expressions, control flow | complete |
+| Classes, fields, methods, inheritance | complete |
+| Collections and iteration | complete |
+| Visibility (public / private via underscore convention) | complete |
+| Signature-aware kwargs resolution (auto-options-struct) | complete |
+| Try / except / raise | complete |
+| Type system (Optional, Union, Callable, Any, tuples) | complete |
+| Modules and Main wrapper | complete |
+| Polish — comments, formatting, precedence-aware parens | complete |
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full milestone breakdown.
+The roadmap from here is real-world use: building a wrapper library for common Python APIs (`PyHaxeSafe`), supporting cross-module imports, and translating real codebases.
 
 ## Installation
 
 ```bash
-git clone https://github.com/<user>/disciplined-haxe
-cd disciplined-haxe
+git clone https://github.com/TheStudent00/PyHaxe
+cd PyHaxe
 pip install -e .
 ```
 
-This installs the package in development mode and provides two CLI commands: `dh-check` and `dh-emit`.
+This installs the package in development mode and provides two CLI commands: `pyhaxe-check` and `pyhaxe-emit`.
 
 ## Usage
 
 Lint a Python file against the discipline:
 
 ```
-$ dh-check examples/inventory_example.py
+$ pyhaxe-check examples/inventory_example.py
 examples/inventory_example.py: ok
 
-$ dh-check examples/bad_example.py
-examples/bad_example.py: 12 violation(s)
+$ pyhaxe-check examples/bad_example.py
+examples/bad_example.py: 15 violation(s)
   line 20: [multiple-inheritance] class BadClass inherits from multiple classes; only one allowed
   line 27: [missing-return-annotation] function add has no return type annotation
-  line 34: [with-statement] with statements have no Haxe equivalent; use try/finally pattern
+  line 34: [with-statement] with statements have no Haxe equivalent; use explicit acquire/release
   line 38: [tuple-unpacking] tuple unpacking not allowed; assign individual variables
   ...
 ```
@@ -95,21 +93,21 @@ The checker exits non-zero when violations are found, so it drops into CI withou
 Compile a disciplined Python file to Haxe:
 
 ```
-$ dh-emit examples/basic_example.py > out/Basic.hx
-$ haxe -main Basic -js basic.js
+$ pyhaxe-emit examples/inventory_example.py > out/Inventory.hx
+$ haxe -main Main -js inventory.js
 ```
 
-## The discipline (brief)
+The `inventory_example.py` translates to a multi-class Haxe file with no manual edits required: it includes a generated `Main` class wrapping the `if __name__ == "__main__":` block, options-struct typedefs for any constructors with default arguments, and an `extern class` stub for each `@haxe_extern`-marked wrapper.
 
-The full discipline is documented in [`docs/DISCIPLINE.md`](docs/DISCIPLINE.md). In short:
+## The discipline
 
-**Required.** Type annotations on every parameter and return value. Class-level field declarations with type annotations. Single inheritance only. Named functions instead of lambdas. Broad exception catches.
+**Required.** Type annotations on every parameter and return value. Class-level field declarations with type annotations. Single inheritance only. Named functions instead of lambdas. Broad exception catches (`except Exception`, not `except IndexError`).
 
-**Forbidden.** `*args` and `**kwargs` in signatures (though kwargs at call sites are fine — the converter resolves them positionally). Tuple unpacking. `with` statements. Generators and `yield`. Multiple inheritance.
+**Forbidden.** `*args` and `**kwargs` in signatures (though kwargs at call sites are fine — the transpiler resolves them). Tuple unpacking on the left of `=`. `with` statements. Generators and `yield`. Multiple inheritance. `try / finally` and `try / else` (no Haxe equivalent). Bare `raise` (must use `raise e` with explicit name).
 
-**Wrapper required.** Non-portable libraries — numpy, file I/O, regex, threading, anything platform-specific — are accessed through wrapper classes marked with the `@haxe_extern` decorator. The decorator tells the converter to skip the class body and assume a hand-written target equivalent exists.
+**Wrapper required.** Non-portable libraries — numpy, file I/O, regex, threading, anything platform-specific — are accessed through wrapper classes marked with the `@haxe_extern` decorator. The decorator tells the transpiler to emit a stub `extern class` declaration and skip the body, expecting a hand-written target-side implementation alongside the generated code.
 
-**Allowed because Haxe handles it well.** `for x in collection`, `for i in range(N)`, `len(x)`, string concatenation with `+`, simple list comprehensions. Disciplines that would be required for more conservative targets are relaxed when Haxe specifically supports them.
+**Allowed because Haxe handles it well.** `for x in collection`, `for i in range(N)`, `len(x)`, string concatenation with `+`, list/dict literals, list/dict subscripting, structural exception hierarchies, kwargs at call sites. Native Python tuples (`tuple[A, B]`, `(a, b)` literals) translate to auto-generated `TupleN` classes — only the arities you actually use get emitted.
 
 ## How it works
 
@@ -126,34 +124,38 @@ class HaxeEmitter:
         handler(node)
 ```
 
-Each AST node type gets a `stmt_X` or `expr_X` method. Unknown node types emit a `// TODO` comment rather than crashing, so partial coverage is visible in output. This is what makes incremental development safe — you can run the converter at any milestone level on any input and immediately see which constructs aren't implemented yet.
+Each AST node type gets a `stmt_X` or `expr_X` method. Unknown node types emit a `// TODO` comment rather than crashing, so partial coverage is visible in output. Comments from the source are preserved separately via Python's `tokenize` module (the `ast` module strips them) and re-injected at the right line positions during emission.
 
 ## Project structure
 
 ```
-src/disciplined_haxe/
-    discipline.py        the @haxe_extern decorator
-    checker.py           AST linter for the disciplined subset
-    emitter.py           AST -> Haxe converter
-    cli.py               dh-check and dh-emit entry points
+src/pyhaxe/
+    discipline.py            the @haxe_extern decorator
+    discipline_checker.py    AST linter for the disciplined subset
+    haxe_emitter.py          AST -> Haxe converter
+    cli.py                   pyhaxe-check and pyhaxe-emit entry points
 examples/
-    basic_example.py     Milestone 1 demo (functions, expressions, control flow)
-    inventory_example.py larger example (classes, collections, exceptions)
-    bad_example.py       deliberate violations for the checker
+    basic_example.py         functions, expressions, control flow
+    classes_example.py       classes, inheritance, static methods
+    collections_example.py   for-loops, lists, dicts, len, append
+    visibility_example.py    private/public via underscore convention
+    kwargs_example.py        options-struct for kwargs functions
+    exceptions_example.py    try/except/raise
+    types_example.py         Optional, Union, Callable, tuples
+    inventory_example.py     larger example using most features
+    bad_example.py           deliberate violations for the checker
 tests/
-    test_checker.py
-    test_emitter.py
+    test_pyhaxe.py           lint and emitter regression tests
 docs/
-    DESIGN.md            full design history and rationale
-    DISCIPLINE.md        discipline rules as a reference
-    ROADMAP.md           milestone breakdown
+    DEVELOPMENT_NOTES.md     workarounds, gotchas, design decisions
 ```
 
 ## Contributing
 
-The project is in early stages. Contributions are especially welcome for working through the milestone roadmap in order, building wrapper classes for common libraries (the accumulated wrapper library is the long-term value of this project), and translating real-world Python codebases into the disciplined subset — every translation surfaces patterns the linter doesn't yet catch.
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup and coding standards.
+The project is in active development. Contributions especially welcome for:
+- building wrapper classes for common libraries (the accumulated wrapper library is the long-term value of this project)
+- translating real-world Python codebases into the disciplined subset (every translation surfaces patterns the linter doesn't yet catch)
+- supporting cross-module imports (currently typing imports are stripped, others are passed through as comments)
 
 ## Acknowledgements
 
