@@ -386,6 +386,10 @@ class HaxeEmitter:
         # "Type Tuple2 is redefined" when several modules in one build dir each
         # use tuples. Default False preserves single-module/standalone output.
         self.shared_tuples = False
+        # Set True the first time a dynamic/unknown-kind operand is lowered to
+        # `Pyhaxe.truthy(...)` in boolean context (F8). Callers can read it to
+        # know whether the shared `Pyhaxe.hx` runtime module must be emitted.
+        self._uses_truthy = False
         # When a module's holder-class name collides with one of its own
         # classes, the module constants/free functions are folded into that
         # class as statics (set in emit_module).
@@ -988,6 +992,39 @@ class HaxeEmitter:
         self.lines = []
         self.tuple_arities = set(arities)
         self._emit_tuple_classes()
+        return self.output()
+
+    def emit_runtime_module(self):
+        # Emit a standalone `Pyhaxe.hx` carrying PyHaxe's runtime support
+        # helpers — currently just `truthy`, the Python-semantic truthiness
+        # used to lower a Dynamic/unknown operand in boolean context (F8).
+        # Called fully-qualified as `Pyhaxe.truthy(x)`, so no per-module import
+        # is needed: Haxe resolves the top-level type by filename. Ship it in
+        # the build dir (like Tuples.hx) whenever any module uses truthy().
+        self.lines = []
+        self.line("// Auto-generated PyHaxe runtime support. Do not edit.")
+        self.line("class Pyhaxe {")
+        self.indent_level += 1
+        self.line("// Python-semantic truthiness for a Dynamic value used in")
+        self.line("// boolean context: false for null; for Bool the value; for")
+        self.line("// Int/Float `!= 0`; for String non-empty; for Array/Map")
+        self.line("// non-empty; otherwise true (a live object).")
+        self.line("public static function truthy(x:Dynamic):Bool {")
+        self.indent_level += 1
+        self.line("if (x == null) return false;")
+        self.line("if (Std.isOfType(x, Bool)) return (x : Bool);")
+        self.line("if (Std.isOfType(x, Float)) return (x : Float) != 0;")
+        self.line("if (Std.isOfType(x, Int)) return (x : Int) != 0;")
+        self.line("if (Std.isOfType(x, String)) return (x : String).length > 0;")
+        self.line("if (Std.isOfType(x, Array)) return (x : Array<Dynamic>).length > 0;")
+        self.line("if (Std.isOfType(x, haxe.Constraints.IMap)) "
+                  "return (x : haxe.Constraints.IMap<Dynamic, Dynamic>)"
+                  ".keys().hasNext();")
+        self.line("return true;")
+        self.indent_level -= 1
+        self.line("}")
+        self.indent_level -= 1
+        self.line("}")
         return self.output()
 
     def _emit_one_tuple_class(self, arity):
@@ -2940,7 +2977,37 @@ class HaxeEmitter:
             # where the nested function returns Null<_BackEdge>).
             inner = self.emit_expr(node)
             return "(" + inner + " != null)"
+        # F8: the operand's kind is Dynamic/unknown (Any/object/Optional with no
+        # tracked class, an untyped field assigned a Dynamic-returning call,
+        # etc.). A bare pass-through here makes hxjava lower `if (dynamic)` to a
+        # hard `(java.lang.Boolean) Object` cast that ClassCastExceptions the
+        # moment the value isn't a Boolean (it bit the editor's snap-clock:
+        # `if self._snap_clock:`, a scheduler handle typed Any). Lower to a
+        # null-safe, Python-semantic truthiness instead. The exceptions above
+        # (bool/str/array/map/set/class) keep their existing precise coercions;
+        # only the genuinely-unknown case routes through the runtime helper.
+        if self._is_dynamic_bool_operand(node):
+            self._uses_truthy = True
+            return "Pyhaxe.truthy(" + self.emit_expr(node) + ")"
         return self.emit_expr(node)
+
+    def _is_dynamic_bool_operand(self, node):
+        # True when `node` in boolean context is a Dynamic/unknown VALUE that
+        # would otherwise pass through bare (and hit hxjava's Boolean cast). We
+        # require an operand SHAPE that denotes a runtime value access — name,
+        # attribute, call, or subscript — whose static kind we failed to resolve
+        # AND which isn't already known to be a Bool. Literals (numbers, None,
+        # True/False) are excluded; they don't suffer the cast. Resolved-Bool
+        # expressions (a `-> bool` call like StringTools.startsWith, a bool-typed
+        # field/local) are excluded too: they're already valid in bool context,
+        # so wrapping them would be needless churn. Anything genuinely unknown is
+        # exactly the cast-prone case, and routes through the helper.
+        if not isinstance(node, (ast.Name, ast.Attribute, ast.Call,
+                                 ast.Subscript)):
+            return False
+        if self._is_bool_expr(node):
+            return False
+        return True
 
     def expr_UnaryOp(self, node):
         # Type-directed truthiness for `not x`. Python `not s` / `not arr`
@@ -2954,6 +3021,13 @@ class HaxeEmitter:
             if kind is not None and kind[0] in ("map", "set", "class"):
                 inner = self.emit_expr(node.operand)
                 return "(" + inner + " == null)"
+            # F8: `not <dynamic>` — same Boolean-cast hazard as the positive
+            # form, plus a bare `!x` on a Dynamic is itself a Haxe type error.
+            # Negate the runtime truthiness so `if not x:` is correct for the
+            # full range of Python falsey values, not just null.
+            if kind is None and self._is_dynamic_bool_operand(node.operand):
+                self._uses_truthy = True
+                return "!Pyhaxe.truthy(" + self.emit_expr(node.operand) + ")"
         op = UNARYOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO unaryop */"
@@ -3720,6 +3794,11 @@ def emit_tuples_module(arities):
     return HaxeEmitter().emit_tuples_module(arities)
 
 
+def emit_runtime_module():
+    # Produce the standalone `Pyhaxe.hx` runtime-support module (F8 truthy()).
+    return HaxeEmitter().emit_runtime_module()
+
+
 def _extract_comments(source):
     # Use tokenize to pull out (line, col, text) for every comment in
     # the source. ast.parse drops comments entirely, so this is the
@@ -3751,9 +3830,14 @@ def main():
         arities = [int(a) for a in args[1:]] or [2, 3, 4]
         print(emit_tuples_module(arities))
         return 0
+    # `--emit-runtime` writes the standalone Pyhaxe.hx runtime-support module.
+    if args and args[0] == "--emit-runtime":
+        print(emit_runtime_module())
+        return 0
     if len(args) != 1:
         print("usage: haxe_emitter.py [--shared-tuples] FILE.py", file=sys.stderr)
         print("       haxe_emitter.py --emit-tuples N [N...]", file=sys.stderr)
+        print("       haxe_emitter.py --emit-runtime", file=sys.stderr)
         return 1
     f = open(args[0], "r")
     try:
