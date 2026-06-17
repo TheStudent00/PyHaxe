@@ -194,7 +194,10 @@ OPERATOR_PRECEDENCE = {
     # Boolean operators (lowest binding).
     ast.Or: 1,
     ast.And: 2,
-    ast.Not: 3,  # Unary not
+    # Unary `not` -> Haxe `!`, which binds TIGHTER than comparison (unlike
+    # Python's low-binding `not`). Since we emit Haxe, use Haxe precedence so
+    # `not (a < b)` parenthesizes its operand -> `!(a < b)`, not `!a < b`.
+    ast.Not: 12,
     # Comparison operators.
     ast.Eq: 4,
     ast.NotEq: 4,
@@ -789,6 +792,13 @@ class HaxeEmitter:
         return is_dunder_name and is_main_str
 
     def _emit_main_class(self, free_functions, main_body, module_consts=None):
+        # Option-struct typedefs for free functions must live at module scope
+        # (Haxe forbids `typedef` inside a class body), so emit them before
+        # opening the holder class.
+        for func in free_functions:
+            sig = self.functions.get(func.name)
+            if sig is not None and sig["uses_options"]:
+                self._emit_options_typedef(sig, self._options_typename(func.name))
         self.line("class " + self.module_class_name + " {")
         self.indent_level += 1
         prev_in_class = self.in_class
@@ -875,11 +885,10 @@ class HaxeEmitter:
         # the static prefix and visibility forced.
         signature = self.functions.get(node.name)
         if signature is not None and signature["uses_options"]:
-            # Options-struct version. The typedef has already been
-            # emitted at the appropriate level (or will be — let's keep
-            # the options form working).
+            # Options-struct version. The typedef is emitted at module scope
+            # by the caller (before the holder class) — Haxe forbids `typedef`
+            # inside a class body.
             type_name = self._options_typename(node.name)
-            self._emit_options_typedef(signature, type_name)
             ret = self.emit_type(node.returns)
             self.line("public static function " + node.name +
                       "(options:" + type_name + "):" + ret + " {")
@@ -1917,6 +1926,13 @@ class HaxeEmitter:
                 if signature["uses_options"]:
                     typedef_name = self._options_typename(method_name, class_name=node.name)
                     self._emit_options_typedef(signature, typedef_name)
+        # Free functions merged into this class (module/class name collision)
+        # also need their option typedefs at module scope, not in the body.
+        if self._merge_into_class == node.name:
+            for func in self._merge_functions:
+                sig = self.functions.get(func.name)
+                if sig is not None and sig["uses_options"]:
+                    self._emit_options_typedef(sig, self._options_typename(func.name))
 
         self.line("class " + node.name + extends_clause + " {")
         self.indent_level += 1
@@ -2673,6 +2689,15 @@ class HaxeEmitter:
                     and rk is not None and rk[0] == "array":
                 return (self.emit_expr(node.left) + ".concat(" +
                         self.emit_expr(node.right) + ")")
+        # Python floor division `a // b` has no Haxe operator. Emit
+        # Std.int(Math.floor(a / b)) so integer floor semantics — including
+        # negative operands — match Python (Haxe `/` is always float division).
+        if isinstance(node.op, ast.FloorDiv):
+            self._prec_stack.append(OPERATOR_PRECEDENCE[ast.Div])
+            left = self.emit_expr(node.left)
+            right = self.emit_expr(node.right)
+            self._prec_stack.pop()
+            return "Std.int(Math.floor(" + left + " / " + right + "))"
         op = BINOP_MAP.get(type(node.op))
         if op is None:
             return "/* TODO binop: " + type(node.op).__name__ + " */"

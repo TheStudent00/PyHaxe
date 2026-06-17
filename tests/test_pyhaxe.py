@@ -383,3 +383,58 @@ def test_cli_entry_points_run():
         assert "Traceback" not in result.stderr, (
             cmd + " crashed: " + result.stderr
         )
+
+
+# ============================================================
+# Emitter fixes: floor division, `not` precedence, free-fn options placement
+# ============================================================
+
+def test_floordiv_emits_std_int_math_floor():
+    # Python `a // b` has no Haxe operator; must emit floor-correct integer
+    # division (was previously `/* TODO binop: FloorDiv */`).
+    source = (
+        "def half(a: int, b: int) -> int:\n"
+        "    return a // b\n"
+    )
+    out = convert(source, "<test>")
+    assert "Std.int(Math.floor(a / b))" in out, out
+    assert "TODO binop" not in out, out
+
+
+def test_floordiv_parenthesizes_looser_operands():
+    # The dividend/divisor must keep their own parens relative to division.
+    source = (
+        "def f(a: int, b: int, c: int) -> int:\n"
+        "    return (a + b) // c\n"
+    )
+    out = convert(source, "<test>")
+    assert "Std.int(Math.floor((a + b) / c))" in out, out
+
+
+def test_not_of_comparison_is_parenthesized():
+    # Haxe `!` binds tighter than `<`, so `not (a < b)` must emit `!(a < b)`,
+    # never `!a < b` (which parses as `(!a) < b`).
+    source = (
+        "def f(a: int, b: int) -> bool:\n"
+        "    return not (a < b)\n"
+    )
+    out = convert(source, "<test>")
+    assert "!(a < b)" in out, out
+    assert "!a < b" not in out, out
+
+
+def test_free_function_default_args_typedef_at_module_scope():
+    # A free function with default args emits an options typedef. It must live
+    # at module scope, NOT inside the generated holder class (Haxe forbids
+    # `typedef` in a class body).
+    source = (
+        "def greet(name: str, greeting: str = \"Hi\") -> str:\n"
+        "    return greeting + \", \" + name\n"
+    )
+    out = convert(source, "<test>")
+    typedef_pos = out.find("typedef GreetOptions")
+    class_pos = out.find("class ")
+    assert typedef_pos != -1, out
+    assert class_pos != -1, out
+    # typedef must appear before the holder class opens.
+    assert typedef_pos < class_pos, out
