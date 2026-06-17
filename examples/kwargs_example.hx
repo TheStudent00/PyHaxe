@@ -46,15 +46,15 @@ class DiscountedItem extends Item {
     }
 }
 
+typedef GreetOptions = {
+    name:String,
+    ?greeting:String,
+    ?excited:Bool
+}
+
 class KwargsExample {
     public static function add(a:Int, b:Int):Int {
         return a + b;
-    }
-    
-    typedef GreetOptions = {
-        name:String,
-        ?greeting:String,
-        ?excited:Bool
     }
     
     public static function greet(options:GreetOptions):String {
